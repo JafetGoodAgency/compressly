@@ -24,6 +24,16 @@ final class Deactivator {
         } catch ( Throwable $e ) {
             Logger::error( 'Deactivation transient cleanup failed: ' . $e->getMessage() );
         }
+
+        try {
+            self::clear_scheduled_events();
+        } catch ( Throwable $e ) {
+            Logger::error( 'Deactivation cron cleanup failed: ' . $e->getMessage() );
+        }
+    }
+
+    private static function clear_scheduled_events(): void {
+        wp_clear_scheduled_hook( 'compressly_optimize_deferred_path' );
     }
 
     private static function delete_transients(): void {

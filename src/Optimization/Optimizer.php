@@ -29,6 +29,11 @@ final class Optimizer {
     public const META_WEBP_PATH      = '_compressly_webp_path';
     public const META_BACKUP_PATH    = '_compressly_backup_path';
 
+    public const CRON_ACTION         = 'compressly_optimize_deferred_path';
+    private const DEFERRED_DELAY_SEC = 30;
+    private const DEFERRED_WAIT_SEC  = 180;
+
+    private const ROLE_UNSCALED         = 'original_unscaled';
     private const MIN_IMPROVEMENT_RATIO = 0.05; // Reject outputs smaller than 5% of original.
 
     private OptionsManager $options;
@@ -49,6 +54,15 @@ final class Optimizer {
         $this->backup    = $backup;
         $this->client    = $client;
         $this->log       = $log;
+    }
+
+    /**
+     * Wires the deferred-optimization cron handler. Must be called from
+     * Plugin::boot() so the action is registered on every request,
+     * regardless of whether an upload happens to be in flight.
+     */
+    public function register_cron(): void {
+        add_action( self::CRON_ACTION, [ $this, 'handle_deferred_path' ], 10, 3 );
     }
 
     /**
@@ -81,16 +95,19 @@ final class Optimizer {
             return;
         }
 
-        $totals = [
-            'original'      => 0,
-            'optimized'     => 0,
-            'webp'          => 0,
-            'processed'     => 0,
-            'skipped'       => 0,
-            'failed'        => 0,
-            'last_error'    => null,
-            'webp_for_root' => null,
-        ];
+        // The raw unscaled original is not served to browsers — it only
+        // exists so plugins like Regenerate Thumbnails can rebuild
+        // sizes from the pristine bytes. Optimizing it on the upload
+        // request blocks the user (large phone photos plus thumbnails
+        // routinely blow past the 60 s SDK wait window) and gains
+        // nothing for delivery. Defer it to wp-cron with a longer wait.
+        $deferred = [];
+        if ( isset( $paths[ self::ROLE_UNSCALED ] ) ) {
+            $deferred[ self::ROLE_UNSCALED ] = $paths[ self::ROLE_UNSCALED ];
+            unset( $paths[ self::ROLE_UNSCALED ] );
+        }
+
+        $totals = $this->fresh_totals();
 
         foreach ( $paths as $role => $path ) {
             try {
@@ -112,8 +129,105 @@ final class Optimizer {
             }
         }
 
+        foreach ( $deferred as $role => $path ) {
+            $scheduled = wp_schedule_single_event(
+                time() + self::DEFERRED_DELAY_SEC,
+                self::CRON_ACTION,
+                [ $attachment_id, (string) $role, (string) $path ]
+            );
+            Logger::trace( 'scheduled deferred path', [
+                'attachment_id' => $attachment_id,
+                'role'          => $role,
+                'path'          => $path,
+                'fire_at'       => time() + self::DEFERRED_DELAY_SEC,
+                'scheduled'     => $scheduled,
+            ] );
+        }
+
         Logger::trace( 'optimize_attachment totals', [ 'attachment_id' => $attachment_id, 'totals' => $totals ] );
         $this->finalize( $attachment_id, $source_path, $totals );
+    }
+
+    /**
+     * Cron callback for paths that were deferred from the synchronous
+     * upload pipeline (currently: original_unscaled). Runs the same
+     * pipeline as the sync path but with a longer SDK wait (cron is
+     * not blocking a user) and records its own log row keyed to the
+     * attachment so audit history stays complete.
+     *
+     * @param mixed $attachment_id
+     * @param mixed $role
+     * @param mixed $path
+     */
+    public function handle_deferred_path( $attachment_id, $role, $path ): void {
+        $attachment_id = (int) $attachment_id;
+        $role          = (string) $role;
+        $path          = (string) $path;
+
+        Logger::trace( 'handle_deferred_path enter', [
+            'attachment_id' => $attachment_id,
+            'role'          => $role,
+            'path'          => $path,
+        ] );
+
+        if ( (bool) $this->options->get( 'kill_switch', false ) ) {
+            Logger::trace( 'handle_deferred_path abort: kill_switch on' );
+            return;
+        }
+
+        if ( $attachment_id <= 0 || $path === '' ) {
+            return;
+        }
+
+        if ( ! file_exists( $path ) ) {
+            Logger::trace( 'handle_deferred_path: source missing, skipping', [ 'path' => $path ] );
+            return;
+        }
+
+        $totals = $this->fresh_totals();
+
+        try {
+            $this->process_single( $path, $role, $totals, self::DEFERRED_WAIT_SEC );
+        } catch ( OptimizationException $e ) {
+            $totals['failed']++;
+            $totals['last_error'] = sprintf( '[%s] %s: %s', $role, $e->kind(), $e->getMessage() );
+            $this->handle_pipeline_exception( $e, $attachment_id, $path, $role );
+        } catch ( Throwable $e ) {
+            $totals['failed']++;
+            $totals['last_error'] = sprintf( '[%s] %s', $role, $e->getMessage() );
+            Logger::error( sprintf( 'Optimizer deferred unexpected error role=%s attachment=%d path=%s: %s', $role, $attachment_id, $path, $e->getMessage() ) );
+        }
+
+        // Deferred runs do NOT touch attachment-level meta — that was
+        // already settled by the synchronous run. Just record a log row
+        // so the audit trail captures what happened to this path.
+        $status = $this->derive_status( $totals );
+        $this->log->record(
+            [
+                'attachment_id'  => $attachment_id,
+                'status'         => $status,
+                'original_size'  => (int) $totals['original'],
+                'optimized_size' => (int) $totals['optimized'],
+                'webp_size'      => $totals['webp'] > 0 ? (int) $totals['webp'] : null,
+                'error_message'  => $totals['last_error'] !== null ? (string) $totals['last_error'] : null,
+            ]
+        );
+    }
+
+    /**
+     * @return array{original:int, optimized:int, webp:int, processed:int, skipped:int, failed:int, last_error:?string, webp_for_root:?string}
+     */
+    private function fresh_totals(): array {
+        return [
+            'original'      => 0,
+            'optimized'     => 0,
+            'webp'          => 0,
+            'processed'     => 0,
+            'skipped'       => 0,
+            'failed'        => 0,
+            'last_error'    => null,
+            'webp_for_root' => null,
+        ];
     }
 
     private function is_already_optimized( int $attachment_id ): bool {
@@ -175,8 +289,8 @@ final class Optimizer {
      * @param array<string, mixed> $totals
      * @throws OptimizationException
      */
-    private function process_single( string $path, string $role, array &$totals ): void {
-        Logger::trace( 'process_single enter', [ 'role' => $role, 'path' => $path ] );
+    private function process_single( string $path, string $role, array &$totals, ?int $wait_override = null ): void {
+        Logger::trace( 'process_single enter', [ 'role' => $role, 'path' => $path, 'wait_override' => $wait_override ] );
 
         $validation = $this->validator->validate( $path );
         Logger::trace( 'process_single validation', [ 'role' => $role, 'status' => $validation->status(), 'reason' => $validation->reason() ] );
@@ -199,7 +313,7 @@ final class Optimizer {
             Logger::trace( 'process_single backup complete', [ 'role' => $role, 'path' => $path ] );
         }
 
-        $outcome  = $this->client->optimize( $path );
+        $outcome  = $this->client->optimize( $path, $wait_override );
         Logger::trace( 'process_single sdk outcome', [
             'role'          => $role,
             'api_same'      => $outcome->api_reported_same(),

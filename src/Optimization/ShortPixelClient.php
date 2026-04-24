@@ -34,7 +34,7 @@ final class ShortPixelClient {
         Defaults::COMPRESSION_GLOSSY   => 2,
     ];
 
-    private const WAIT_SECONDS      = 60;
+    public const WAIT_SECONDS       = 60;
     private const MAX_RETRIES       = 3;
     private const RETRY_BACKOFF_SEC = [ 2, 4, 8 ];
     private const TEMP_DIR_NAME     = 'compressly-tmp';
@@ -54,7 +54,7 @@ final class ShortPixelClient {
      *
      * @throws OptimizationException
      */
-    public function optimize( string $source_path ): OptimizationOutcome {
+    public function optimize( string $source_path, ?int $wait_seconds = null ): OptimizationOutcome {
         if ( ! file_exists( $source_path ) ) {
             throw OptimizationException::io( 'Source not found: ' . $source_path );
         }
@@ -72,6 +72,7 @@ final class ShortPixelClient {
         $resize   = (bool) $this->options->get( 'resize_enabled', true );
         $max_w    = (int) $this->options->get( 'resize_max_width', 2560 );
         $max_h    = (int) $this->options->get( 'resize_max_height', 2560 );
+        $wait     = $wait_seconds !== null && $wait_seconds > 0 ? $wait_seconds : self::WAIT_SECONDS;
 
         Logger::trace( 'client optimize start', [
             'source'  => $source_path,
@@ -82,10 +83,11 @@ final class ShortPixelClient {
             'resize'  => $resize,
             'max_w'   => $max_w,
             'max_h'   => $max_h,
+            'wait'    => $wait,
         ] );
 
         $result = $this->call_sdk_with_retry(
-            function () use ( $source_path, $temp_dir, $level, $webp, $resize, $max_w, $max_h ) {
+            function () use ( $source_path, $temp_dir, $level, $webp, $resize, $max_w, $max_h, $wait ) {
                 $commander = \ShortPixel\fromFile( $source_path );
                 $commander = $commander->optimize( $level );
                 if ( $webp ) {
@@ -94,7 +96,7 @@ final class ShortPixelClient {
                 if ( $resize && $max_w > 0 && $max_h > 0 ) {
                     $commander = $commander->resize( $max_w, $max_h, false );
                 }
-                return $commander->wait( self::WAIT_SECONDS )->toFiles( $temp_dir );
+                return $commander->wait( $wait )->toFiles( $temp_dir );
             }
         );
 

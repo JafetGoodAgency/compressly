@@ -73,6 +73,7 @@ final class Plugin {
         $log       = new LogRepository();
         $optimizer = new Optimizer( $options, $validator, $backup, $client, $log );
         ( new UploadHandler( $optimizer ) )->register();
+        $optimizer->register_cron();
     }
 
     private function __construct() {}
