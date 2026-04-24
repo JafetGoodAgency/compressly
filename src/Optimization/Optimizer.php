@@ -117,10 +117,25 @@ final class Optimizer {
     }
 
     /**
-     * @return array<string, string> Map of role ("original" or size name) => absolute path.
+     * @return array<string, string> Map of role (reserved keys "original"/"original_unscaled", or thumbnail size name) => absolute path.
      */
     private function collect_paths( int $attachment_id, string $source_path ): array {
-        $paths    = [ 'original' => $source_path ];
+        $paths = [];
+
+        // When a large upload triggers WordPress's big_image_size_threshold,
+        // get_attached_file() returns the -scaled variant used for delivery
+        // and the untouched raw file lives next to it. Optimize the raw
+        // original too so it doesn't sit full-size on disk and so our
+        // backup tree retains the true pre-compression bytes.
+        if ( function_exists( 'wp_get_original_image_path' ) ) {
+            $unscaled = wp_get_original_image_path( $attachment_id );
+            if ( is_string( $unscaled ) && $unscaled !== '' && $unscaled !== $source_path && file_exists( $unscaled ) ) {
+                $paths['original_unscaled'] = $unscaled;
+            }
+        }
+
+        $paths['original'] = $source_path;
+
         $metadata = wp_get_attachment_metadata( $attachment_id );
         if ( ! is_array( $metadata ) || empty( $metadata['sizes'] ) || ! is_array( $metadata['sizes'] ) ) {
             return $paths;
