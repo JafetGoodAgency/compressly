@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and attach compressly.zip
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'
+          tools: composer:v2
+          coverage: none
+
+      - name: Install production dependencies
+        run: composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction --no-progress
+
+      - name: Build plugin zip
+        run: |
+          set -euo pipefail
+          STAGING="$(mktemp -d)"
+          PLUGIN_DIR="$STAGING/compressly"
+          mkdir -p "$PLUGIN_DIR"
+          rsync -a ./ "$PLUGIN_DIR/" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.gitignore' \
+            --exclude='.gitattributes' \
+            --exclude='.DS_Store' \
+            --exclude='node_modules' \
+            --exclude='tests' \
+            --exclude='phpunit.xml' \
+            --exclude='phpunit.xml.dist' \
+            --exclude='phpcs.xml' \
+            --exclude='phpcs.xml.dist' \
+            --exclude='composer.json' \
+            --exclude='composer.lock' \
+            --exclude='CLAUDE_CODE_KICKOFF.md' \
+            --exclude='COMPRESSLY_SPEC.md' \
+            --exclude='.env' \
+            --exclude='.env.*'
+          (cd "$STAGING" && zip -rq compressly.zip compressly)
+          mv "$STAGING/compressly.zip" "$GITHUB_WORKSPACE/compressly.zip"
+
+      - name: Attach zip to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" compressly.zip --clobber
