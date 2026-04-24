@@ -1,0 +1,115 @@
+/*
+ * Compressly admin styles.
+ *
+ * Scoped under .compressly-settings so we never bleed into other admin
+ * screens. Leans on WP's existing form-table and nav-tab styles for
+ * the heavy lifting; we only add tab-panel show/hide, the sticky save
+ * bar, and our brand accent.
+ */
+
+:root {
+    --compressly-accent: #0EA5A4;
+    --compressly-accent-hover: #0c8d8c;
+    --compressly-warning-bg: #fcf9e8;
+    --compressly-warning-border: #dba617;
+    --compressly-danger-bg: #fcf0f1;
+    --compressly-danger-border: #d63638;
+    --compressly-panel-bg: #f6f7f7;
+}
+
+.compressly-settings {
+    max-width: 1100px;
+}
+
+.compressly-settings .compressly-tab-panel {
+    display: none;
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-top: none;
+    padding: 8px 24px 24px;
+    margin-bottom: 16px;
+}
+
+.compressly-settings .compressly-tab-panel.is-active {
+    display: block;
+}
+
+.compressly-settings .nav-tab-active,
+.compressly-settings .nav-tab-active:focus,
+.compressly-settings .nav-tab-active:hover {
+    border-bottom-color: #fff;
+    color: var(--compressly-accent);
+}
+
+.compressly-settings .compressly-save-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 10;
+    margin: 0 -24px -24px;
+    padding: 12px 24px;
+    background: var(--compressly-panel-bg);
+    border-top: 1px solid #c3c4c7;
+    box-shadow: 0 -2px 4px rgba( 0, 0, 0, 0.04 );
+}
+
+.compressly-settings .compressly-save-bar .button-primary {
+    background: var(--compressly-accent);
+    border-color: var(--compressly-accent);
+}
+
+.compressly-settings .compressly-save-bar .button-primary:hover,
+.compressly-settings .compressly-save-bar .button-primary:focus {
+    background: var(--compressly-accent-hover);
+    border-color: var(--compressly-accent-hover);
+}
+
+.compressly-settings .compressly-warning {
+    background: var(--compressly-warning-bg);
+    border-left: 4px solid var(--compressly-warning-border);
+    padding: 8px 12px;
+    margin: 8px 0 0;
+}
+
+.compressly-settings .compressly-danger {
+    background: var(--compressly-danger-bg);
+    border-left: 4px solid var(--compressly-danger-border);
+    padding: 8px 12px;
+    margin: 8px 0 0;
+}
+
+.compressly-settings input[type="number"] {
+    width: 90px;
+}
+
+.compressly-settings textarea {
+    width: 100%;
+    max-width: 600px;
+    min-height: 110px;
+    font-family: Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+
+.compressly-settings .compressly-radio-group label,
+.compressly-settings .compressly-checkbox-list label {
+    display: block;
+    margin-bottom: 6px;
+}
+
+.compressly-settings .compressly-checkbox-list {
+    columns: 2;
+    column-gap: 24px;
+    max-width: 600px;
+}
+
+@media ( max-width: 600px ) {
+    .compressly-settings .compressly-checkbox-list {
+        columns: 1;
+    }
+    .compressly-settings .compressly-tab-panel {
+        padding: 8px 12px 16px;
+    }
+    .compressly-settings .compressly-save-bar {
+        margin: 0 -12px -16px;
+        padding: 12px;
+    }
+}
