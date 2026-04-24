@@ -31,7 +31,7 @@ final class Defaults {
     public static function all(): array {
         return [
             'api_key'                  => '',
-            'compression_level'        => self::COMPRESSION_LOSSY,
+            'compression_level'        => self::COMPRESSION_GLOSSY,
             'webp_enabled'             => true,
             'resize_enabled'           => true,
             'resize_max_width'         => 2560,
