@@ -316,14 +316,13 @@ final class Optimizer {
      * @param array{original:int, optimized:int, webp:int, processed:int, skipped:int, failed:int, last_error:?string, webp_for_root:?string} $totals
      */
     private function finalize( int $attachment_id, string $source_path, array $totals ): void {
-        $status = LogRepository::STATUS_SUCCESS;
-        if ( $totals['processed'] === 0 && $totals['skipped'] > 0 && $totals['failed'] === 0 ) {
-            $status = LogRepository::STATUS_SKIPPED;
-        } elseif ( $totals['failed'] > 0 && $totals['processed'] === 0 ) {
-            $status = LogRepository::STATUS_FAILED;
-        }
+        $status = $this->derive_status( $totals );
 
-        if ( $status === LogRepository::STATUS_SUCCESS ) {
+        // SUCCESS and PARTIAL both update attachment-level meta: at least
+        // one path was optimized, so the attachment is no longer in its
+        // pristine state and Phase 4's bulk processor should skip the
+        // already-compressed paths next time.
+        if ( in_array( $status, [ LogRepository::STATUS_SUCCESS, LogRepository::STATUS_PARTIAL ], true ) ) {
             update_post_meta( $attachment_id, self::META_OPTIMIZED, 1 );
             update_post_meta( $attachment_id, self::META_VERSION, defined( 'COMPRESSLY_VERSION' ) ? COMPRESSLY_VERSION : '' );
             update_post_meta( $attachment_id, self::META_ORIGINAL_SIZE, (int) $totals['original'] );
@@ -349,6 +348,22 @@ final class Optimizer {
                 'error_message'  => $totals['last_error'] !== null ? (string) $totals['last_error'] : null,
             ]
         );
+    }
+
+    /**
+     * @param array{processed:int, skipped:int, failed:int} $totals
+     */
+    private function derive_status( array $totals ): string {
+        if ( $totals['failed'] > 0 && $totals['processed'] > 0 ) {
+            return LogRepository::STATUS_PARTIAL;
+        }
+        if ( $totals['failed'] > 0 ) {
+            return LogRepository::STATUS_FAILED;
+        }
+        if ( $totals['processed'] === 0 && $totals['skipped'] > 0 ) {
+            return LogRepository::STATUS_SKIPPED;
+        }
+        return LogRepository::STATUS_SUCCESS;
     }
 
     private function webp_target_path( string $source_path ): string {
