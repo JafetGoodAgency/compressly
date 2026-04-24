@@ -17,6 +17,7 @@ namespace GoodAgency\Compressly;
 
 use GoodAgency\Compressly\Admin\Notices;
 use GoodAgency\Compressly\Database\LogRepository;
+use GoodAgency\Compressly\Database\Schema;
 use GoodAgency\Compressly\Optimization\BackupManager;
 use GoodAgency\Compressly\Optimization\FileValidator;
 use GoodAgency\Compressly\Optimization\Optimizer;
@@ -50,6 +51,8 @@ final class Plugin {
             false,
             dirname( plugin_basename( COMPRESSLY_PLUGIN_FILE ) ) . '/languages'
         );
+
+        Schema::ensure_current();
 
         $options = new OptionsManager();
 

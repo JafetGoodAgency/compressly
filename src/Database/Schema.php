@@ -12,11 +12,15 @@ declare(strict_types=1);
 
 namespace GoodAgency\Compressly\Database;
 
+use GoodAgency\Compressly\Support\Logger;
 use RuntimeException;
+use Throwable;
 
 final class Schema {
 
-    public const TABLE_SUFFIX = 'compressly_log';
+    public const TABLE_SUFFIX   = 'compressly_log';
+    public const DB_VERSION     = '2';
+    public const VERSION_OPTION = 'compressly_db_version';
 
     public static function table_name(): string {
         global $wpdb;
@@ -31,10 +35,12 @@ final class Schema {
         $table           = self::table_name();
         $charset_collate = $wpdb->get_charset_collate();
 
+        // status is varchar (not enum) so adding new statuses (e.g. "partial")
+        // is a value-only change with no schema migration needed.
         $sql = "CREATE TABLE {$table} (
             id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
             attachment_id bigint(20) unsigned NOT NULL,
-            status enum('pending','success','failed','skipped') NOT NULL DEFAULT 'pending',
+            status varchar(20) NOT NULL DEFAULT 'pending',
             original_size int unsigned NOT NULL DEFAULT 0,
             optimized_size int unsigned NOT NULL DEFAULT 0,
             webp_size int unsigned DEFAULT NULL,
@@ -51,6 +57,26 @@ final class Schema {
         $exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
         if ( $exists !== $table ) {
             throw new RuntimeException( sprintf( 'Failed to create table %s.', $table ) );
+        }
+    }
+
+    /**
+     * Compare the stored schema version against DB_VERSION and run
+     * install() (which is idempotent via dbDelta) when they differ.
+     * Called from Plugin::boot() so updates that don't fire the
+     * activation hook still pick up the new schema.
+     */
+    public static function ensure_current(): void {
+        $stored = (string) get_option( self::VERSION_OPTION, '0' );
+        if ( $stored === self::DB_VERSION ) {
+            return;
+        }
+
+        try {
+            self::install();
+            update_option( self::VERSION_OPTION, self::DB_VERSION, true );
+        } catch ( Throwable $e ) {
+            Logger::error( 'Schema migration failed: ' . $e->getMessage() );
         }
     }
 

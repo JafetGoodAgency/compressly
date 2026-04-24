@@ -24,6 +24,7 @@ final class Activator {
     public static function activate(): void {
         try {
             Schema::install();
+            update_option( Schema::VERSION_OPTION, Schema::DB_VERSION, true );
         } catch ( Throwable $e ) {
             Logger::error( 'Schema installation failed during activation: ' . $e->getMessage() );
         }

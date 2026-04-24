@@ -20,6 +20,7 @@ final class LogRepository {
     public const STATUS_SUCCESS = 'success';
     public const STATUS_FAILED  = 'failed';
     public const STATUS_SKIPPED = 'skipped';
+    public const STATUS_PARTIAL = 'partial';
 
     /**
      * Insert one row describing the outcome for an attachment.
@@ -57,7 +58,13 @@ final class LogRepository {
     }
 
     private static function normalize_status( string $status ): string {
-        $allowed = [ self::STATUS_PENDING, self::STATUS_SUCCESS, self::STATUS_FAILED, self::STATUS_SKIPPED ];
+        $allowed = [
+            self::STATUS_PENDING,
+            self::STATUS_SUCCESS,
+            self::STATUS_FAILED,
+            self::STATUS_SKIPPED,
+            self::STATUS_PARTIAL,
+        ];
         return in_array( $status, $allowed, true ) ? $status : self::STATUS_PENDING;
     }
 }
