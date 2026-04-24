@@ -17,6 +17,7 @@ namespace GoodAgency\Compressly\Optimization;
 
 use GoodAgency\Compressly\Settings\Defaults;
 use GoodAgency\Compressly\Settings\OptionsManager;
+use GoodAgency\Compressly\Support\Logger;
 use ShortPixel\AccountException;
 use ShortPixel\ClientException;
 use ShortPixel\ConnectionException;
@@ -72,6 +73,17 @@ final class ShortPixelClient {
         $max_w    = (int) $this->options->get( 'resize_max_width', 2560 );
         $max_h    = (int) $this->options->get( 'resize_max_height', 2560 );
 
+        Logger::trace( 'client optimize start', [
+            'source'  => $source_path,
+            'bytes'   => $original_size,
+            'temp'    => $temp_dir,
+            'level'   => $level,
+            'webp'    => $webp,
+            'resize'  => $resize,
+            'max_w'   => $max_w,
+            'max_h'   => $max_h,
+        ] );
+
         $result = $this->call_sdk_with_retry(
             function () use ( $source_path, $temp_dir, $level, $webp, $resize, $max_w, $max_h ) {
                 $commander = \ShortPixel\fromFile( $source_path );
@@ -86,7 +98,39 @@ final class ShortPixelClient {
             }
         );
 
+        Logger::trace( 'client sdk result', [
+            'source'    => $source_path,
+            'succeeded' => is_array( $result->succeeded ?? null ) ? count( $result->succeeded ) : null,
+            'same'      => is_array( $result->same ?? null ) ? count( $result->same ) : null,
+            'failed'    => is_array( $result->failed ?? null ) ? count( $result->failed ) : null,
+            'pending'   => is_array( $result->pending ?? null ) ? count( $result->pending ) : null,
+            'failed_first_status' => ! empty( $result->failed ) && isset( $result->failed[0]->Status ) ? (array) $result->failed[0]->Status : null,
+            'temp_dir_contents'   => $this->scan_temp_dir( $temp_dir ),
+        ] );
+
         return $this->outcome_from_result( $source_path, $original_size, $temp_dir, $webp, $result );
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function scan_temp_dir( string $temp_dir ): array {
+        if ( ! is_dir( $temp_dir ) ) {
+            return [];
+        }
+        $entries = scandir( $temp_dir );
+        if ( $entries === false ) {
+            return [];
+        }
+        $list = [];
+        foreach ( $entries as $entry ) {
+            if ( $entry === '.' || $entry === '..' ) {
+                continue;
+            }
+            $full = $temp_dir . '/' . $entry;
+            $list[] = $entry . ' (' . ( is_file( $full ) ? (string) filesize( $full ) : 'dir' ) . ')';
+        }
+        return $list;
     }
 
     /**
@@ -191,23 +235,28 @@ final class ShortPixelClient {
 
         if ( ! empty( $result->failed ) ) {
             $item    = $result->failed[0];
+            $code    = isset( $item->Status->Code ) ? (string) $item->Status->Code : '';
             $message = isset( $item->Status->Message ) ? (string) $item->Status->Message : 'Optimization failed.';
-            throw OptimizationException::unknown( 'ShortPixel reported failure: ' . $message );
+            Logger::trace( 'outcome_from_result branch=failed', [ 'source' => $source_path, 'code' => $code, 'message' => $message ] );
+            throw OptimizationException::unknown( 'ShortPixel reported failure (code=' . $code . '): ' . $message );
         }
 
         if ( ! empty( $result->pending ) ) {
+            Logger::trace( 'outcome_from_result branch=pending', [ 'source' => $source_path ] );
             throw OptimizationException::network( 'Optimization still pending after wait window expired.' );
         }
 
         $api_same = ! empty( $result->same );
 
         if ( ! $api_same && empty( $result->succeeded ) ) {
+            Logger::trace( 'outcome_from_result branch=empty', [ 'source' => $source_path ] );
             throw OptimizationException::unknown( 'ShortPixel returned no processable items.' );
         }
 
         clearstatcache();
 
         if ( $api_same ) {
+            Logger::trace( 'outcome_from_result branch=same', [ 'source' => $source_path, 'original_size' => $original_size ] );
             return new OptimizationOutcome(
                 $source_path,
                 $original_size,
@@ -220,6 +269,7 @@ final class ShortPixelClient {
         }
 
         if ( ! file_exists( $optimized ) ) {
+            Logger::trace( 'outcome_from_result branch=missing_optimized_file', [ 'source' => $source_path, 'expected' => $optimized ] );
             throw OptimizationException::io( 'Optimized file missing from temp dir: ' . $optimized );
         }
 
@@ -231,6 +281,12 @@ final class ShortPixelClient {
             $webp_path = $webp_target;
             $webp_size = (int) filesize( $webp_target );
         }
+
+        Logger::trace( 'outcome_from_result branch=succeeded', [
+            'source'         => $source_path,
+            'optimized_size' => $optimized_size,
+            'webp_size'      => $webp_size,
+        ] );
 
         return new OptimizationOutcome(
             $source_path,

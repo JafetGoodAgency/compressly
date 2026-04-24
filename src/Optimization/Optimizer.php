@@ -57,20 +57,26 @@ final class Optimizer {
      * version, the call is a no-op.
      */
     public function optimize_attachment( int $attachment_id ): void {
+        Logger::trace( 'optimize_attachment enter', [ 'attachment_id' => $attachment_id ] );
+
         if ( (bool) $this->options->get( 'kill_switch', false ) ) {
+            Logger::trace( 'optimize_attachment abort: kill_switch on', [ 'attachment_id' => $attachment_id ] );
             return;
         }
 
         if ( $this->is_already_optimized( $attachment_id ) ) {
+            Logger::trace( 'optimize_attachment skip: already optimized at current version', [ 'attachment_id' => $attachment_id ] );
             return;
         }
 
         $source_path = get_attached_file( $attachment_id );
         if ( ! is_string( $source_path ) || $source_path === '' ) {
+            Logger::trace( 'optimize_attachment abort: get_attached_file returned empty', [ 'attachment_id' => $attachment_id ] );
             return;
         }
 
         $paths = $this->collect_paths( $attachment_id, $source_path );
+        Logger::trace( 'collect_paths', [ 'attachment_id' => $attachment_id, 'source' => $source_path, 'paths' => $paths ] );
         if ( $paths === [] ) {
             return;
         }
@@ -88,11 +94,11 @@ final class Optimizer {
 
         foreach ( $paths as $role => $path ) {
             try {
-                $this->process_single( (string) $path, $role, $totals );
+                $this->process_single( (string) $path, (string) $role, $totals );
             } catch ( OptimizationException $e ) {
                 $totals['failed']++;
-                $totals['last_error'] = $e->getMessage();
-                $this->handle_pipeline_exception( $e, $attachment_id, $path );
+                $totals['last_error'] = sprintf( '[%s] %s: %s', $role, $e->kind(), $e->getMessage() );
+                $this->handle_pipeline_exception( $e, $attachment_id, (string) $path, (string) $role );
 
                 // Abort on auth/quota failures — every subsequent file
                 // will fail the same way and burn retries.
@@ -101,11 +107,12 @@ final class Optimizer {
                 }
             } catch ( Throwable $e ) {
                 $totals['failed']++;
-                $totals['last_error'] = $e->getMessage();
-                Logger::error( sprintf( 'Optimizer unexpected error for %s: %s', $path, $e->getMessage() ) );
+                $totals['last_error'] = sprintf( '[%s] %s', $role, $e->getMessage() );
+                Logger::error( sprintf( 'Optimizer unexpected error role=%s attachment=%d path=%s: %s', $role, $attachment_id, $path, $e->getMessage() ) );
             }
         }
 
+        Logger::trace( 'optimize_attachment totals', [ 'attachment_id' => $attachment_id, 'totals' => $totals ] );
         $this->finalize( $attachment_id, $source_path, $totals );
     }
 
@@ -129,6 +136,13 @@ final class Optimizer {
         // backup tree retains the true pre-compression bytes.
         if ( function_exists( 'wp_get_original_image_path' ) ) {
             $unscaled = wp_get_original_image_path( $attachment_id );
+            Logger::trace( 'collect_paths wp_get_original_image_path', [
+                'attachment_id' => $attachment_id,
+                'unscaled'      => $unscaled,
+                'source'        => $source_path,
+                'differs'       => ( is_string( $unscaled ) && $unscaled !== $source_path ),
+                'exists'        => ( is_string( $unscaled ) && $unscaled !== '' && file_exists( $unscaled ) ),
+            ] );
             if ( is_string( $unscaled ) && $unscaled !== '' && $unscaled !== $source_path && file_exists( $unscaled ) ) {
                 $paths['original_unscaled'] = $unscaled;
             }
@@ -162,11 +176,14 @@ final class Optimizer {
      * @throws OptimizationException
      */
     private function process_single( string $path, string $role, array &$totals ): void {
+        Logger::trace( 'process_single enter', [ 'role' => $role, 'path' => $path ] );
+
         $validation = $this->validator->validate( $path );
+        Logger::trace( 'process_single validation', [ 'role' => $role, 'status' => $validation->status(), 'reason' => $validation->reason() ] );
 
         if ( $validation->is_skip() ) {
             $totals['skipped']++;
-            Logger::info( sprintf( 'Skip %s: %s', $path, $validation->reason() ) );
+            Logger::info( sprintf( 'Skip role=%s %s: %s', $role, $path, $validation->reason() ) );
             return;
         }
 
@@ -175,18 +192,31 @@ final class Optimizer {
         }
 
         $original_size = (int) filesize( $path );
+        Logger::trace( 'process_single original_size', [ 'role' => $role, 'bytes' => $original_size ] );
 
         if ( (bool) $this->options->get( 'backup_originals', true ) ) {
             $this->backup->backup( $path );
+            Logger::trace( 'process_single backup complete', [ 'role' => $role, 'path' => $path ] );
         }
 
         $outcome  = $this->client->optimize( $path );
+        Logger::trace( 'process_single sdk outcome', [
+            'role'          => $role,
+            'api_same'      => $outcome->api_reported_same(),
+            'has_optimized' => $outcome->has_optimized_output(),
+            'optimized_tmp' => $outcome->optimized_temp_path(),
+            'optimized_size'=> $outcome->optimized_size(),
+            'has_webp'      => $outcome->has_webp_output(),
+            'webp_tmp'      => $outcome->webp_temp_path(),
+            'webp_size'     => $outcome->webp_size(),
+        ] );
         $temp_dir = $outcome->optimized_temp_path() !== null
             ? dirname( (string) $outcome->optimized_temp_path() )
             : ( $outcome->webp_temp_path() !== null ? dirname( (string) $outcome->webp_temp_path() ) : null );
 
         try {
             if ( $outcome->api_reported_same() ) {
+                Logger::trace( 'process_single api_reported_same branch', [ 'role' => $role, 'bytes' => $original_size ] );
                 $totals['original']  += $original_size;
                 $totals['optimized'] += $original_size;
                 $totals['processed']++;
@@ -228,6 +258,7 @@ final class Optimizer {
 
         // Size sanity: if output is larger, keep the original.
         if ( $optimized >= $original ) {
+            Logger::trace( 'apply_sanity_and_move kept original (larger optimized)', [ 'role' => $role, 'original' => $original, 'optimized' => $optimized ] );
             $totals['original']  += $original;
             $totals['optimized'] += $original;
             $totals['processed']++;
@@ -236,7 +267,16 @@ final class Optimizer {
 
         // Atomic replace.
         $temp_optimized = (string) $outcome->optimized_temp_path();
-        if ( ! @rename( $temp_optimized, $path ) ) {
+        $rename_ok      = @rename( $temp_optimized, $path );
+        Logger::trace( 'apply_sanity_and_move rename', [
+            'role'       => $role,
+            'from'       => $temp_optimized,
+            'to'         => $path,
+            'success'    => $rename_ok,
+            'from_exists'=> file_exists( $temp_optimized ),
+            'to_writable'=> is_writable( dirname( $path ) ),
+        ] );
+        if ( ! $rename_ok ) {
             throw OptimizationException::io( 'Failed to move optimized file into place: ' . $path );
         }
 
@@ -245,8 +285,10 @@ final class Optimizer {
         $totals['processed']++;
 
         if ( $outcome->has_webp_output() ) {
-            $webp_target = $this->webp_target_path( $path );
-            if ( @rename( (string) $outcome->webp_temp_path(), $webp_target ) ) {
+            $webp_target     = $this->webp_target_path( $path );
+            $webp_rename_ok  = @rename( (string) $outcome->webp_temp_path(), $webp_target );
+            Logger::trace( 'apply_sanity_and_move webp rename', [ 'role' => $role, 'to' => $webp_target, 'success' => $webp_rename_ok ] );
+            if ( $webp_rename_ok ) {
                 $totals['webp'] += (int) $outcome->webp_size();
                 if ( $role === 'original' ) {
                     $totals['webp_for_root'] = $this->relative_to_uploads( $webp_target );
@@ -257,8 +299,8 @@ final class Optimizer {
         }
     }
 
-    private function handle_pipeline_exception( OptimizationException $e, int $attachment_id, string $path ): void {
-        Logger::error( sprintf( 'Optimizer[%s] %s: %s', $e->kind(), $path, $e->getMessage() ) );
+    private function handle_pipeline_exception( OptimizationException $e, int $attachment_id, string $path, string $role ): void {
+        Logger::error( sprintf( 'Optimizer[%s] role=%s attachment=%d path=%s: %s', $e->kind(), $role, $attachment_id, $path, $e->getMessage() ) );
 
         switch ( $e->kind() ) {
             case OptimizationException::KIND_API_KEY_INVALID:

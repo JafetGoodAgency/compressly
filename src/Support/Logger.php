@@ -39,6 +39,20 @@ final class Logger {
     }
 
     /**
+     * Fine-grained pipeline trace. Skipped unless WP_DEBUG is true so
+     * production sites stay quiet and only actively-debugged staging
+     * environments emit trace output.
+     *
+     * @param array<string, mixed> $context
+     */
+    public static function trace( string $message, array $context = [] ): void {
+        if ( ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
+            return;
+        }
+        self::write( 'TRACE', $message, $context );
+    }
+
+    /**
      * @param array<string, mixed> $context
      */
     private static function write( string $level, string $message, array $context ): void {
