@@ -1,0 +1,319 @@
+<?php
+/**
+ * Coordinates the end-to-end optimization of a single attachment.
+ *
+ * Enumerates the original plus every generated thumbnail, runs each
+ * through FileValidator, backs up originals when enabled, calls
+ * ShortPixelClient, applies the spec's size-sanity checks, atomically
+ * renames the optimized bytes over the source, writes post_meta, and
+ * records the attachment's outcome in the compressly_log table.
+ *
+ * @package GoodAgency\Compressly
+ */
+
+declare(strict_types=1);
+
+namespace GoodAgency\Compressly\Optimization;
+
+use GoodAgency\Compressly\Database\LogRepository;
+use GoodAgency\Compressly\Settings\OptionsManager;
+use GoodAgency\Compressly\Support\Logger;
+use Throwable;
+
+final class Optimizer {
+
+    public const META_OPTIMIZED      = '_compressly_optimized';
+    public const META_VERSION        = '_compressly_version';
+    public const META_ORIGINAL_SIZE  = '_compressly_original_size';
+    public const META_OPTIMIZED_SIZE = '_compressly_optimized_size';
+    public const META_WEBP_PATH      = '_compressly_webp_path';
+    public const META_BACKUP_PATH    = '_compressly_backup_path';
+
+    private const MIN_IMPROVEMENT_RATIO = 0.05; // Reject outputs smaller than 5% of original.
+
+    private OptionsManager $options;
+    private FileValidator $validator;
+    private BackupManager $backup;
+    private ShortPixelClient $client;
+    private LogRepository $log;
+
+    public function __construct(
+        OptionsManager $options,
+        FileValidator $validator,
+        BackupManager $backup,
+        ShortPixelClient $client,
+        LogRepository $log
+    ) {
+        $this->options   = $options;
+        $this->validator = $validator;
+        $this->backup    = $backup;
+        $this->client    = $client;
+        $this->log       = $log;
+    }
+
+    /**
+     * Optimize every file for a given attachment. Idempotent: if the
+     * attachment is already flagged as optimized at the current plugin
+     * version, the call is a no-op.
+     */
+    public function optimize_attachment( int $attachment_id ): void {
+        if ( (bool) $this->options->get( 'kill_switch', false ) ) {
+            return;
+        }
+
+        if ( $this->is_already_optimized( $attachment_id ) ) {
+            return;
+        }
+
+        $source_path = get_attached_file( $attachment_id );
+        if ( ! is_string( $source_path ) || $source_path === '' ) {
+            return;
+        }
+
+        $paths = $this->collect_paths( $attachment_id, $source_path );
+        if ( $paths === [] ) {
+            return;
+        }
+
+        $totals = [
+            'original'      => 0,
+            'optimized'     => 0,
+            'webp'          => 0,
+            'processed'     => 0,
+            'skipped'       => 0,
+            'failed'        => 0,
+            'last_error'    => null,
+            'webp_for_root' => null,
+        ];
+
+        foreach ( $paths as $role => $path ) {
+            try {
+                $this->process_single( (string) $path, $role, $totals );
+            } catch ( OptimizationException $e ) {
+                $totals['failed']++;
+                $totals['last_error'] = $e->getMessage();
+                $this->handle_pipeline_exception( $e, $attachment_id, $path );
+
+                // Abort on auth/quota failures — every subsequent file
+                // will fail the same way and burn retries.
+                if ( in_array( $e->kind(), [ OptimizationException::KIND_API_KEY_INVALID, OptimizationException::KIND_QUOTA_EXCEEDED ], true ) ) {
+                    break;
+                }
+            } catch ( Throwable $e ) {
+                $totals['failed']++;
+                $totals['last_error'] = $e->getMessage();
+                Logger::error( sprintf( 'Optimizer unexpected error for %s: %s', $path, $e->getMessage() ) );
+            }
+        }
+
+        $this->finalize( $attachment_id, $source_path, $totals );
+    }
+
+    private function is_already_optimized( int $attachment_id ): bool {
+        $flag    = get_post_meta( $attachment_id, self::META_OPTIMIZED, true );
+        $version = (string) get_post_meta( $attachment_id, self::META_VERSION, true );
+        $current = defined( 'COMPRESSLY_VERSION' ) ? (string) COMPRESSLY_VERSION : '';
+        return ! empty( $flag ) && $version !== '' && $version === $current;
+    }
+
+    /**
+     * @return array<string, string> Map of role ("original" or size name) => absolute path.
+     */
+    private function collect_paths( int $attachment_id, string $source_path ): array {
+        $paths    = [ 'original' => $source_path ];
+        $metadata = wp_get_attachment_metadata( $attachment_id );
+        if ( ! is_array( $metadata ) || empty( $metadata['sizes'] ) || ! is_array( $metadata['sizes'] ) ) {
+            return $paths;
+        }
+
+        $excluded = (array) $this->options->get( 'excluded_thumbnail_sizes', [] );
+        $dir      = dirname( $source_path );
+
+        foreach ( $metadata['sizes'] as $size_name => $size_data ) {
+            if ( in_array( (string) $size_name, array_map( 'strval', $excluded ), true ) ) {
+                continue;
+            }
+            if ( empty( $size_data['file'] ) ) {
+                continue;
+            }
+            $paths[ (string) $size_name ] = $dir . '/' . $size_data['file'];
+        }
+
+        return $paths;
+    }
+
+    /**
+     * @param array<string, mixed> $totals
+     * @throws OptimizationException
+     */
+    private function process_single( string $path, string $role, array &$totals ): void {
+        $validation = $this->validator->validate( $path );
+
+        if ( $validation->is_skip() ) {
+            $totals['skipped']++;
+            Logger::info( sprintf( 'Skip %s: %s', $path, $validation->reason() ) );
+            return;
+        }
+
+        if ( $validation->is_fail() ) {
+            throw OptimizationException::io( $validation->reason() );
+        }
+
+        $original_size = (int) filesize( $path );
+
+        if ( (bool) $this->options->get( 'backup_originals', true ) ) {
+            $this->backup->backup( $path );
+        }
+
+        $outcome  = $this->client->optimize( $path );
+        $temp_dir = $outcome->optimized_temp_path() !== null
+            ? dirname( (string) $outcome->optimized_temp_path() )
+            : ( $outcome->webp_temp_path() !== null ? dirname( (string) $outcome->webp_temp_path() ) : null );
+
+        try {
+            if ( $outcome->api_reported_same() ) {
+                $totals['original']  += $original_size;
+                $totals['optimized'] += $original_size;
+                $totals['processed']++;
+                return;
+            }
+
+            $this->apply_sanity_and_move( $path, $outcome, $role, $totals );
+        } finally {
+            if ( $temp_dir !== null ) {
+                $this->client->cleanup_temp( $temp_dir );
+            }
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $totals
+     * @throws OptimizationException
+     */
+    private function apply_sanity_and_move( string $path, OptimizationOutcome $outcome, string $role, array &$totals ): void {
+        $original  = $outcome->original_size();
+        $optimized = $outcome->optimized_size();
+
+        if ( ! $outcome->has_optimized_output() ) {
+            throw OptimizationException::corruptResult( 'Optimized file missing on disk: ' . $path );
+        }
+
+        if ( $optimized <= 0 ) {
+            throw OptimizationException::corruptResult( 'Optimized file is empty: ' . $path );
+        }
+
+        // Size sanity: reject pathologically small output as corrupt.
+        if ( $optimized < (int) floor( $original * self::MIN_IMPROVEMENT_RATIO ) ) {
+            throw OptimizationException::corruptResult( sprintf(
+                'Optimized output (%d B) < 5%% of original (%d B). Rejected.',
+                $optimized,
+                $original
+            ) );
+        }
+
+        // Size sanity: if output is larger, keep the original.
+        if ( $optimized >= $original ) {
+            $totals['original']  += $original;
+            $totals['optimized'] += $original;
+            $totals['processed']++;
+            return;
+        }
+
+        // Atomic replace.
+        $temp_optimized = (string) $outcome->optimized_temp_path();
+        if ( ! @rename( $temp_optimized, $path ) ) {
+            throw OptimizationException::io( 'Failed to move optimized file into place: ' . $path );
+        }
+
+        $totals['original']  += $original;
+        $totals['optimized'] += $optimized;
+        $totals['processed']++;
+
+        if ( $outcome->has_webp_output() ) {
+            $webp_target = $this->webp_target_path( $path );
+            if ( @rename( (string) $outcome->webp_temp_path(), $webp_target ) ) {
+                $totals['webp'] += (int) $outcome->webp_size();
+                if ( $role === 'original' ) {
+                    $totals['webp_for_root'] = $this->relative_to_uploads( $webp_target );
+                }
+            } else {
+                Logger::warning( 'Failed to move WebP file into place: ' . $webp_target );
+            }
+        }
+    }
+
+    private function handle_pipeline_exception( OptimizationException $e, int $attachment_id, string $path ): void {
+        Logger::error( sprintf( 'Optimizer[%s] %s: %s', $e->kind(), $path, $e->getMessage() ) );
+
+        switch ( $e->kind() ) {
+            case OptimizationException::KIND_API_KEY_INVALID:
+                set_transient( 'compressly_error_api_key_invalid', 1, HOUR_IN_SECONDS );
+                break;
+            case OptimizationException::KIND_QUOTA_EXCEEDED:
+                set_transient( 'compressly_error_quota_exceeded', 1, HOUR_IN_SECONDS );
+                break;
+        }
+    }
+
+    /**
+     * @param array{original:int, optimized:int, webp:int, processed:int, skipped:int, failed:int, last_error:?string, webp_for_root:?string} $totals
+     */
+    private function finalize( int $attachment_id, string $source_path, array $totals ): void {
+        $status = LogRepository::STATUS_SUCCESS;
+        if ( $totals['processed'] === 0 && $totals['skipped'] > 0 && $totals['failed'] === 0 ) {
+            $status = LogRepository::STATUS_SKIPPED;
+        } elseif ( $totals['failed'] > 0 && $totals['processed'] === 0 ) {
+            $status = LogRepository::STATUS_FAILED;
+        }
+
+        if ( $status === LogRepository::STATUS_SUCCESS ) {
+            update_post_meta( $attachment_id, self::META_OPTIMIZED, 1 );
+            update_post_meta( $attachment_id, self::META_VERSION, defined( 'COMPRESSLY_VERSION' ) ? COMPRESSLY_VERSION : '' );
+            update_post_meta( $attachment_id, self::META_ORIGINAL_SIZE, (int) $totals['original'] );
+            update_post_meta( $attachment_id, self::META_OPTIMIZED_SIZE, (int) $totals['optimized'] );
+
+            if ( ! empty( $totals['webp_for_root'] ) ) {
+                update_post_meta( $attachment_id, self::META_WEBP_PATH, (string) $totals['webp_for_root'] );
+            }
+
+            $backup_relative = $this->backup->relative_backup_path( $source_path );
+            if ( $backup_relative !== '' && (bool) $this->options->get( 'backup_originals', true ) ) {
+                update_post_meta( $attachment_id, self::META_BACKUP_PATH, $backup_relative );
+            }
+        }
+
+        $this->log->record(
+            [
+                'attachment_id'  => $attachment_id,
+                'status'         => $status,
+                'original_size'  => (int) $totals['original'],
+                'optimized_size' => (int) $totals['optimized'],
+                'webp_size'      => $totals['webp'] > 0 ? (int) $totals['webp'] : null,
+                'error_message'  => $totals['last_error'] !== null ? (string) $totals['last_error'] : null,
+            ]
+        );
+    }
+
+    private function webp_target_path( string $source_path ): string {
+        $dir      = dirname( $source_path );
+        $filename = pathinfo( $source_path, PATHINFO_FILENAME );
+        return $dir . '/' . $filename . '.webp';
+    }
+
+    private function relative_to_uploads( string $absolute_path ): string {
+        $upload_dir = wp_get_upload_dir();
+        $basedir    = isset( $upload_dir['basedir'] ) ? (string) $upload_dir['basedir'] : '';
+        if ( $basedir === '' ) {
+            return '';
+        }
+
+        $normalized_base = rtrim( str_replace( '\\', '/', $basedir ), '/' ) . '/';
+        $normalized_path = str_replace( '\\', '/', $absolute_path );
+
+        if ( strpos( $normalized_path, $normalized_base ) !== 0 ) {
+            return '';
+        }
+
+        return ltrim( substr( $normalized_path, strlen( $normalized_base ) ), '/' );
+    }
+}
