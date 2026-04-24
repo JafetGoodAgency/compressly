@@ -14,6 +14,8 @@ declare(strict_types=1);
 
 namespace GoodAgency\Compressly;
 
+use GoodAgency\Compressly\Settings\OptionsManager;
+use GoodAgency\Compressly\Settings\SettingsPage;
 use LogicException;
 
 final class Plugin {
@@ -40,6 +42,10 @@ final class Plugin {
             false,
             dirname( plugin_basename( COMPRESSLY_PLUGIN_FILE ) ) . '/languages'
         );
+
+        if ( is_admin() ) {
+            ( new SettingsPage( new OptionsManager() ) )->register();
+        }
     }
 
     private function __construct() {}
