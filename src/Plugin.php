@@ -15,6 +15,7 @@ declare(strict_types=1);
 
 namespace GoodAgency\Compressly;
 
+use GoodAgency\Compressly\Admin\AssetManager;
 use GoodAgency\Compressly\Admin\Notices;
 use GoodAgency\Compressly\Database\LogRepository;
 use GoodAgency\Compressly\Database\Schema;
@@ -63,6 +64,7 @@ final class Plugin {
         if ( is_admin() ) {
             ( new SettingsPage( $options ) )->register();
             ( new Notices() )->register();
+            ( new AssetManager() )->register();
         }
     }
 
