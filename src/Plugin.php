@@ -5,8 +5,9 @@
  * Bootstraps the plugin on `plugins_loaded`. Kept as a singleton so the
  * activation/deactivation hooks and the `plugins_loaded` callback all
  * resolve to the same instance. Owns the top-level dependency wiring
- * for every phase — upload handler (when the kill switch is off),
- * settings page, and admin notices.
+ * for every phase — upload handler and cron (when the kill switch is
+ * off), settings page, admin notices, asset enqueueing, bulk page,
+ * and the bulk AJAX endpoints.
  *
  * @package GoodAgency\Compressly
  */
@@ -17,6 +18,9 @@ namespace GoodAgency\Compressly;
 
 use GoodAgency\Compressly\Admin\AssetManager;
 use GoodAgency\Compressly\Admin\Notices;
+use GoodAgency\Compressly\Bulk\BulkPage;
+use GoodAgency\Compressly\Bulk\BulkProcessor;
+use GoodAgency\Compressly\Bulk\QueueManager;
 use GoodAgency\Compressly\Database\LogRepository;
 use GoodAgency\Compressly\Database\Schema;
 use GoodAgency\Compressly\Optimization\BackupManager;
@@ -55,27 +59,29 @@ final class Plugin {
 
         Schema::ensure_current();
 
-        $options = new OptionsManager();
+        $options   = new OptionsManager();
+        $log       = new LogRepository();
+        $backup    = new BackupManager();
+        $optimizer = $this->build_optimizer( $options, $log, $backup );
 
         if ( ! (bool) $options->get( 'kill_switch', false ) ) {
-            $this->register_optimization( $options );
+            ( new UploadHandler( $optimizer ) )->register();
+            $optimizer->register_cron();
         }
 
         if ( is_admin() ) {
             ( new SettingsPage( $options ) )->register();
             ( new Notices() )->register();
             ( new AssetManager() )->register();
+            ( new BulkPage( $options ) )->register();
+            ( new BulkProcessor( new QueueManager(), $optimizer, $backup ) )->register();
         }
     }
 
-    private function register_optimization( OptionsManager $options ): void {
+    private function build_optimizer( OptionsManager $options, LogRepository $log, BackupManager $backup ): Optimizer {
         $validator = new FileValidator( $options );
-        $backup    = new BackupManager();
         $client    = new ShortPixelClient( $options );
-        $log       = new LogRepository();
-        $optimizer = new Optimizer( $options, $validator, $backup, $client, $log );
-        ( new UploadHandler( $optimizer ) )->register();
-        $optimizer->register_cron();
+        return new Optimizer( $options, $validator, $backup, $client, $log );
     }
 
     private function __construct() {}
