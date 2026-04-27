@@ -21,8 +21,21 @@ use GoodAgency\Compressly\Support\Security;
 
 final class BulkPage {
 
-    public const MENU_SLUG        = 'compressly-bulk';
-    public const PAGE_HOOK_SUFFIX = 'media_page_compressly-bulk';
+    public const MENU_SLUG = 'compressly-bulk';
+
+    /**
+     * The hook suffix returned by add_media_page() once the menu is
+     * registered. WordPress derives this at runtime from the parent
+     * menu and slug, and the value can vary across WP versions when
+     * $admin_page_hooks is not yet populated. Capturing the actual
+     * return value is the only reliable way to know what
+     * admin_enqueue_scripts will receive.
+     */
+    private static ?string $hook_suffix = null;
+
+    public static function hook_suffix(): ?string {
+        return self::$hook_suffix;
+    }
 
     private OptionsManager $options;
 
@@ -35,13 +48,17 @@ final class BulkPage {
     }
 
     public function add_menu(): void {
-        add_media_page(
+        $hook = add_media_page(
             __( 'Compressly Bulk Optimization', 'compressly' ),
             __( 'Compressly', 'compressly' ),
             Security::BULK_CAPABILITY,
             self::MENU_SLUG,
             [ $this, 'render' ]
         );
+
+        if ( is_string( $hook ) && $hook !== '' ) {
+            self::$hook_suffix = $hook;
+        }
     }
 
     public function render(): void {

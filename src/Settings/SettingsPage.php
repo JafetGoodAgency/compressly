@@ -64,13 +64,31 @@ final class SettingsPage {
     }
 
     public function add_menu(): void {
-        add_options_page(
+        $hook = add_options_page(
             __( 'Compressly', 'compressly' ),
             __( 'Compressly', 'compressly' ),
             Security::MANAGE_CAPABILITY,
             self::MENU_SLUG,
             [ $this, 'render' ]
         );
+
+        if ( is_string( $hook ) && $hook !== '' ) {
+            self::$hook_suffix = $hook;
+        }
+    }
+
+    /**
+     * The hook suffix returned by add_options_page() once the menu is
+     * registered. AssetManager reads this at runtime instead of
+     * comparing against a hardcoded constant — different WP versions
+     * derive the suffix slightly differently and capturing the return
+     * value is the only authoritative way to know what
+     * admin_enqueue_scripts will receive.
+     */
+    private static ?string $hook_suffix = null;
+
+    public static function hook_suffix(): ?string {
+        return self::$hook_suffix;
     }
 
     public function register_settings(): void {
