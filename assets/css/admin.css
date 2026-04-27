@@ -113,3 +113,186 @@
         padding: 12px;
     }
 }
+
+/* ---------- Media → Compressly bulk page ---------- */
+
+.compressly-bulk {
+    max-width: 1100px;
+}
+
+.compressly-bulk .compressly-stats-grid {
+    display: grid;
+    grid-template-columns: repeat( auto-fit, minmax( 160px, 1fr ) );
+    gap: 12px;
+    margin: 16px 0;
+}
+
+.compressly-bulk .compressly-stat-card {
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-radius: 4px;
+    padding: 16px;
+    text-align: center;
+}
+
+.compressly-bulk .compressly-stat-value {
+    font-size: 28px;
+    font-weight: 600;
+    color: var(--compressly-accent);
+    line-height: 1.1;
+}
+
+.compressly-bulk .compressly-stat-label {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #50575e;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.compressly-bulk .compressly-progress-card {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-radius: 4px;
+    padding: 16px;
+    margin-bottom: 16px;
+}
+
+.compressly-bulk .compressly-progress-ring {
+    position: relative;
+    width: 80px;
+    height: 80px;
+    flex-shrink: 0;
+}
+
+.compressly-bulk .compressly-progress-ring svg {
+    transform: rotate( -90deg );
+}
+
+.compressly-bulk .compressly-progress-ring-bg,
+.compressly-bulk .compressly-progress-ring-fg {
+    fill: none;
+    stroke-width: 8;
+    stroke-linecap: round;
+}
+
+.compressly-bulk .compressly-progress-ring-bg {
+    stroke: #e0e0e1;
+}
+
+.compressly-bulk .compressly-progress-ring-fg {
+    stroke: var(--compressly-accent);
+    stroke-dasharray: 213.6;
+    stroke-dashoffset: 213.6;
+    transition: stroke-dashoffset 0.3s ease-out;
+}
+
+.compressly-bulk .compressly-progress-percent {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.compressly-bulk .compressly-progress-info {
+    flex: 1;
+}
+
+.compressly-bulk .compressly-progress-status {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.compressly-bulk .compressly-progress-detail {
+    margin: 4px 0 0;
+    color: #50575e;
+}
+
+.compressly-bulk .compressly-controls {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+
+.compressly-bulk .compressly-controls .button-primary {
+    background: var(--compressly-accent);
+    border-color: var(--compressly-accent);
+}
+
+.compressly-bulk .compressly-controls .button-primary:hover,
+.compressly-bulk .compressly-controls .button-primary:focus {
+    background: var(--compressly-accent-hover);
+    border-color: var(--compressly-accent-hover);
+}
+
+.compressly-bulk .compressly-card {
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-radius: 4px;
+    padding: 12px 16px;
+    margin-bottom: 12px;
+}
+
+.compressly-bulk .compressly-card[open] {
+    padding-bottom: 16px;
+}
+
+.compressly-bulk .compressly-card summary {
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+}
+
+.compressly-bulk .compressly-card summary::-webkit-details-marker {
+    display: none;
+}
+
+.compressly-bulk .compressly-card summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 0.15s ease-out;
+}
+
+.compressly-bulk .compressly-card[open] summary::before {
+    transform: rotate( 90deg );
+}
+
+.compressly-bulk .compressly-error-list {
+    margin: 8px 0;
+    padding: 0;
+    list-style: none;
+    max-height: 240px;
+    overflow-y: auto;
+}
+
+.compressly-bulk .compressly-error-list li {
+    padding: 6px 0;
+    border-bottom: 1px solid #f0f0f1;
+    font-family: Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+
+.compressly-bulk .compressly-error-list li:last-child {
+    border-bottom: 0;
+}
+
+.compressly-bulk .compressly-restore-output {
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: #f6f7f7;
+    border-radius: 3px;
+    min-height: 1.5em;
+}
+
+.compressly-bulk .compressly-restore-output:empty {
+    display: none;
+}
