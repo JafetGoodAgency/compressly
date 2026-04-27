@@ -69,30 +69,33 @@ final class Optimizer {
      * Optimize every file for a given attachment. Idempotent: if the
      * attachment is already flagged as optimized at the current plugin
      * version, the call is a no-op.
+     *
+     * @return array{status: string, error: ?string} Status is one of
+     *   "success", "partial", "failed", "skipped", "noop".
      */
-    public function optimize_attachment( int $attachment_id ): void {
+    public function optimize_attachment( int $attachment_id ): array {
         Logger::trace( 'optimize_attachment enter', [ 'attachment_id' => $attachment_id ] );
 
         if ( (bool) $this->options->get( 'kill_switch', false ) ) {
             Logger::trace( 'optimize_attachment abort: kill_switch on', [ 'attachment_id' => $attachment_id ] );
-            return;
+            return self::noop_result();
         }
 
         if ( $this->is_already_optimized( $attachment_id ) ) {
             Logger::trace( 'optimize_attachment skip: already optimized at current version', [ 'attachment_id' => $attachment_id ] );
-            return;
+            return self::noop_result();
         }
 
         $source_path = get_attached_file( $attachment_id );
         if ( ! is_string( $source_path ) || $source_path === '' ) {
             Logger::trace( 'optimize_attachment abort: get_attached_file returned empty', [ 'attachment_id' => $attachment_id ] );
-            return;
+            return self::noop_result();
         }
 
         $paths = $this->collect_paths( $attachment_id, $source_path );
         Logger::trace( 'collect_paths', [ 'attachment_id' => $attachment_id, 'source' => $source_path, 'paths' => $paths ] );
         if ( $paths === [] ) {
-            return;
+            return self::noop_result();
         }
 
         // The raw unscaled original is not served to browsers — it only
@@ -145,7 +148,14 @@ final class Optimizer {
         }
 
         Logger::trace( 'optimize_attachment totals', [ 'attachment_id' => $attachment_id, 'totals' => $totals ] );
-        $this->finalize( $attachment_id, $source_path, $totals );
+        return $this->finalize( $attachment_id, $source_path, $totals );
+    }
+
+    /**
+     * @return array{status: string, error: null}
+     */
+    private static function noop_result(): array {
+        return [ 'status' => 'noop', 'error' => null ];
     }
 
     /**
@@ -428,8 +438,9 @@ final class Optimizer {
 
     /**
      * @param array{original:int, optimized:int, webp:int, processed:int, skipped:int, failed:int, last_error:?string, webp_for_root:?string} $totals
+     * @return array{status: string, error: ?string}
      */
-    private function finalize( int $attachment_id, string $source_path, array $totals ): void {
+    private function finalize( int $attachment_id, string $source_path, array $totals ): array {
         $status = $this->derive_status( $totals );
 
         // SUCCESS and PARTIAL both update attachment-level meta: at least
@@ -462,6 +473,11 @@ final class Optimizer {
                 'error_message'  => $totals['last_error'] !== null ? (string) $totals['last_error'] : null,
             ]
         );
+
+        return [
+            'status' => $status,
+            'error'  => $totals['last_error'] !== null ? (string) $totals['last_error'] : null,
+        ];
     }
 
     /**
