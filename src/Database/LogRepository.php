@@ -14,6 +14,8 @@ declare(strict_types=1);
 
 namespace GoodAgency\Compressly\Database;
 
+use GoodAgency\Compressly\Support\Logger;
+
 final class LogRepository {
 
     public const STATUS_PENDING = 'pending';
@@ -53,6 +55,18 @@ final class LogRepository {
         $formats = [ '%d', '%s', '%d', '%d', '%d', '%s', '%s', '%s' ];
 
         $inserted = $wpdb->insert( Schema::table_name(), $row, $formats );
+
+        Logger::trace(
+            'LogRepository::record',
+            [
+                'attachment_id' => $row['attachment_id'],
+                'status'        => $row['status'],
+                'inserted'      => $inserted,
+                'insert_id'     => $inserted ? (int) $wpdb->insert_id : 0,
+                'last_error'    => $inserted ? '' : (string) $wpdb->last_error,
+                'last_query'    => $inserted ? '' : (string) $wpdb->last_query,
+            ]
+        );
 
         return $inserted ? (int) $wpdb->insert_id : 0;
     }

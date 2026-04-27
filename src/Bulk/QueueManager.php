@@ -22,6 +22,7 @@ declare(strict_types=1);
 namespace GoodAgency\Compressly\Bulk;
 
 use GoodAgency\Compressly\Optimization\Optimizer;
+use GoodAgency\Compressly\Support\Logger;
 
 final class QueueManager {
 
@@ -78,7 +79,29 @@ final class QueueManager {
         $state['status']         = $pending > 0 ? self::STATUS_RUNNING : self::STATUS_COMPLETE;
         $state['started_at']     = time();
         $state['total_at_start'] = $pending;
+
+        Logger::trace(
+            'QueueManager::start computed',
+            [
+                'pending' => $pending,
+                'status'  => $state['status'],
+            ]
+        );
+
         $this->persist( $state );
+
+        // Read back to confirm the option actually persisted. If it
+        // did not, get_option returns false and we know the write
+        // dropped silently somewhere downstream of update_option.
+        $verified = get_option( self::STATE_OPTION, '__missing__' );
+        Logger::trace(
+            'QueueManager::start verified',
+            [
+                'option_name'    => self::STATE_OPTION,
+                'option_present' => $verified !== '__missing__',
+                'verified_type'  => gettype( $verified ),
+            ]
+        );
 
         return $state;
     }
@@ -159,7 +182,20 @@ final class QueueManager {
                 $skip_ids[] = (int) $item['id'];
             }
         }
-        return $this->query_pending_ids( $size, $skip_ids );
+
+        $ids = $this->query_pending_ids( $size, $skip_ids );
+
+        Logger::trace(
+            'QueueManager::next_batch_ids',
+            [
+                'requested_size' => $size,
+                'skip_count'     => count( $skip_ids ),
+                'returned_ids'   => $ids,
+                'returned_count' => count( $ids ),
+            ]
+        );
+
+        return $ids;
     }
 
     /**
@@ -184,7 +220,18 @@ final class QueueManager {
         // autoload=false: this option may grow as failures accumulate;
         // we only want it loaded when the bulk page or its AJAX
         // endpoints actually need it.
-        update_option( self::STATE_OPTION, $state, false );
+        $result = update_option( self::STATE_OPTION, $state, false );
+        Logger::trace(
+            'QueueManager::persist',
+            [
+                'option_name'   => self::STATE_OPTION,
+                'update_result' => $result,
+                'status'        => $state['status'] ?? null,
+                'processed'     => $state['processed'] ?? null,
+                'failed'        => $state['failed'] ?? null,
+                'skipped'       => $state['skipped'] ?? null,
+            ]
+        );
     }
 
     private function count_total_images(): int {

@@ -88,6 +88,14 @@ final class BulkProcessor {
     public function ajax_process_batch(): void {
         $this->guard();
 
+        Logger::trace(
+            'BulkProcessor::ajax_process_batch enter',
+            [
+                'user_id'    => get_current_user_id(),
+                'batch_size' => self::BATCH_SIZE,
+            ]
+        );
+
         $state = $this->queue->get_state();
         $batch = [
             'attempted' => 0,
@@ -98,13 +106,34 @@ final class BulkProcessor {
             'ids'       => [],
         ];
 
+        Logger::trace(
+            'BulkProcessor::ajax_process_batch state at entry',
+            [
+                'status'         => $state['status'] ?? null,
+                'processed'      => $state['processed'] ?? null,
+                'failed'         => $state['failed'] ?? null,
+                'skipped'        => $state['skipped'] ?? null,
+                'total_at_start' => $state['total_at_start'] ?? null,
+            ]
+        );
+
         if ( $state['status'] !== QueueManager::STATUS_RUNNING ) {
+            Logger::trace( 'BulkProcessor::ajax_process_batch early return: not running' );
             wp_send_json_success( $this->snapshot( $batch ) );
             return;
         }
 
         $ids = $this->queue->next_batch_ids( self::BATCH_SIZE );
+        Logger::trace(
+            'BulkProcessor::ajax_process_batch ids',
+            [
+                'ids'   => $ids,
+                'count' => count( $ids ),
+            ]
+        );
+
         if ( $ids === [] ) {
+            Logger::trace( 'BulkProcessor::ajax_process_batch empty queue → transition_to_complete' );
             $this->queue->transition_to_complete();
             wp_send_json_success( $this->snapshot( $batch ) );
             return;
@@ -125,6 +154,26 @@ final class BulkProcessor {
 
             $status = (string) ( $result['status'] ?? 'noop' );
             $error  = isset( $result['error'] ) ? (string) $result['error'] : '';
+
+            // Read post_meta after the optimizer returns so we can
+            // verify (a) META_OPTIMIZED was actually set when status
+            // is success/partial, and (b) META_VERSION matches the
+            // current plugin version. Mismatches here mean
+            // optimize_attachment claimed success but did not finish
+            // its meta updates.
+            $meta_optimized = get_post_meta( $id, '_compressly_optimized', true );
+            $meta_version   = get_post_meta( $id, '_compressly_version', true );
+
+            Logger::trace(
+                'BulkProcessor::ajax_process_batch result',
+                [
+                    'id'             => $id,
+                    'status'         => $status,
+                    'error'          => $error,
+                    'meta_optimized' => $meta_optimized,
+                    'meta_version'   => $meta_version,
+                ]
+            );
 
             switch ( $status ) {
                 case 'success':
@@ -153,6 +202,13 @@ final class BulkProcessor {
                     break;
             }
         }
+
+        Logger::trace(
+            'BulkProcessor::ajax_process_batch exit',
+            [
+                'batch' => $batch,
+            ]
+        );
 
         wp_send_json_success( $this->snapshot( $batch ) );
     }
