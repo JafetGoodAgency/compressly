@@ -32,6 +32,7 @@ use GoodAgency\Compressly\Optimization\ShortPixelClient;
 use GoodAgency\Compressly\Optimization\UploadHandler;
 use GoodAgency\Compressly\Settings\OptionsManager;
 use GoodAgency\Compressly\Settings\SettingsPage;
+use GoodAgency\Compressly\Updater\GitHubUpdater;
 use LogicException;
 
 final class Plugin {
@@ -78,6 +79,7 @@ final class Plugin {
             ( new AssetManager() )->register();
             ( new BulkPage( $options ) )->register();
             ( new BulkProcessor( new QueueManager(), $optimizer, $backup ) )->register();
+            ( new GitHubUpdater( $options, COMPRESSLY_PLUGIN_FILE ) )->register();
         }
     }
 

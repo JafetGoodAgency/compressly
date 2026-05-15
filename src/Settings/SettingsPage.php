@@ -42,6 +42,7 @@ final class SettingsPage {
         'backup_originals',
         'kill_switch',
         'remove_data_on_uninstall',
+        'update_check_enabled',
     ];
 
     /** Numeric settings: key => [min, max]. */
@@ -166,6 +167,10 @@ final class SettingsPage {
 
         add_settings_section( 'compressly_section_uninstall', __( 'Uninstall Behaviour', 'compressly' ), '__return_false', $page );
         add_settings_field( 'remove_data_on_uninstall', __( 'Remove All Data On Uninstall', 'compressly' ), [ $this, 'render_field_remove_data_on_uninstall' ], $page, 'compressly_section_uninstall', [ 'label_for' => 'compressly_remove_data_on_uninstall' ] );
+
+        add_settings_section( 'compressly_section_updates', __( 'Updates', 'compressly' ), [ $this, 'render_section_updates_intro' ], $page );
+        add_settings_field( 'update_check_enabled', __( 'Check For Updates', 'compressly' ), [ $this, 'render_field_update_check_enabled' ], $page, 'compressly_section_updates', [ 'label_for' => 'compressly_update_check_enabled' ] );
+        add_settings_field( 'update_branch', __( 'Update Channel (Branch)', 'compressly' ), [ $this, 'render_field_update_branch' ], $page, 'compressly_section_updates', [ 'label_for' => 'compressly_update_branch' ] );
     }
 
     public function render(): void {
@@ -235,6 +240,13 @@ final class SettingsPage {
 
     public function render_section_lazy_intro(): void {
         echo '<p>' . esc_html__( 'Native loading="lazy" is added to img tags in post content. The first N images are left eager so the LCP is not delayed.', 'compressly' ) . '</p>';
+    }
+
+    public function render_section_updates_intro(): void {
+        echo '<p>' . wp_kses(
+            __( 'Compressly self-updates from the official GitHub repository at <code>JafetGoodAgency/compressly</code>. WordPress polls for new releases on its normal twice-daily schedule; available updates appear under Dashboard → Updates and on the Plugins screen.', 'compressly' ),
+            [ 'code' => [] ]
+        ) . '</p>';
     }
 
     // ---------- Field renderers ----------
@@ -374,6 +386,28 @@ final class SettingsPage {
         echo '<p class="description">' . esc_html__( 'Selected sizes are skipped during optimization. The original and -scaled variants are always processed.', 'compressly' ) . '</p>';
     }
 
+    public function render_field_update_check_enabled(): void {
+        $this->render_checkbox(
+            'update_check_enabled',
+            (bool) $this->options->get( 'update_check_enabled', true ),
+            __( 'Show plugin updates from GitHub in the WordPress admin', 'compressly' )
+        );
+        echo '<p class="description">' . esc_html__( 'Off behaves like a kill switch for the auto-update mechanism: WordPress will not advertise new releases of Compressly. The plugin itself keeps working.', 'compressly' ) . '</p>';
+    }
+
+    public function render_field_update_branch(): void {
+        $value = (string) $this->options->get( 'update_branch', 'main' );
+        printf(
+            '<input type="text" id="compressly_update_branch" name="%1$s[update_branch]" value="%2$s" class="regular-text" pattern="[A-Za-z0-9._/-]+" maxlength="100" spellcheck="false" />',
+            esc_attr( Defaults::OPTION_NAME ),
+            esc_attr( $value )
+        );
+        echo '<p class="description">' . wp_kses(
+            __( 'GitHub branch to track for releases. Leave as <code>main</code> on production sites; switch to <code>beta</code> on staging to receive pre-release tags first. The <code>COMPRESSLY_UPDATE_CHANNEL</code> constant in wp-config.php, if defined, overrides this setting.', 'compressly' ),
+            [ 'code' => [] ]
+        ) . '</p>';
+    }
+
     public function render_field_remove_data_on_uninstall(): void {
         $this->render_checkbox(
             'remove_data_on_uninstall',
@@ -433,8 +467,34 @@ final class SettingsPage {
         $this->sanitize_numerics( $input, $clean );
         $this->sanitize_exclusion_patterns( $input, $clean );
         $this->sanitize_excluded_thumbnail_sizes( $input, $clean );
+        $this->sanitize_update_branch( $input, $clean );
 
         return $clean;
+    }
+
+    /**
+     * @param array<string, mixed> $input
+     * @param array<string, mixed> $clean
+     */
+    private function sanitize_update_branch( array $input, array &$clean ): void {
+        if ( ! array_key_exists( 'update_branch', $input ) ) {
+            return;
+        }
+        $value = trim( (string) $input['update_branch'] );
+        if ( $value === '' ) {
+            $clean['update_branch'] = 'main';
+            return;
+        }
+        if ( preg_match( '#^[A-Za-z0-9._/-]{1,100}$#', $value ) !== 1 ) {
+            add_settings_error(
+                Defaults::OPTION_NAME,
+                'compressly_update_branch_invalid',
+                __( 'Update branch contains unsupported characters; keeping the previous value.', 'compressly' ),
+                'error'
+            );
+            return;
+        }
+        $clean['update_branch'] = $value;
     }
 
     /**

@@ -44,6 +44,8 @@ final class Defaults {
             'excluded_thumbnail_sizes' => [],
             'kill_switch'              => false,
             'remove_data_on_uninstall' => false,
+            'update_check_enabled'     => true,
+            'update_branch'            => 'main',
         ];
     }
 }
