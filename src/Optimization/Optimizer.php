@@ -83,18 +83,21 @@ final class Optimizer {
 
         if ( $this->is_already_optimized( $attachment_id ) ) {
             Logger::trace( 'optimize_attachment skip: already optimized at current version', [ 'attachment_id' => $attachment_id ] );
+            $this->ensure_log_row_for_optimized( $attachment_id );
             return self::noop_result();
         }
 
         $source_path = get_attached_file( $attachment_id );
         if ( ! is_string( $source_path ) || $source_path === '' ) {
             Logger::trace( 'optimize_attachment abort: get_attached_file returned empty', [ 'attachment_id' => $attachment_id ] );
+            $this->record_unprocessable( $attachment_id, 'get_attached_file returned empty' );
             return self::noop_result();
         }
 
         $paths = $this->collect_paths( $attachment_id, $source_path );
         Logger::trace( 'collect_paths', [ 'attachment_id' => $attachment_id, 'source' => $source_path, 'paths' => $paths ] );
         if ( $paths === [] ) {
+            $this->record_unprocessable( $attachment_id, 'collect_paths returned empty' );
             return self::noop_result();
         }
 
@@ -156,6 +159,47 @@ final class Optimizer {
      */
     private static function noop_result(): array {
         return [ 'status' => 'noop', 'error' => null ];
+    }
+
+    /**
+     * Idempotency-short-circuit case: meta says this attachment was
+     * already optimized at the current plugin version. The bulk
+     * processor's pagination is keyed off the log table, so if the
+     * log row is missing for any reason (meta/log drift from a
+     * pre-v3 install, manual edits, partial migrations) the
+     * attachment would be re-selected forever. Writing a log row
+     * here is the durable "yes, we've seen this" signal that
+     * next_batch_ids() filters against.
+     */
+    private function ensure_log_row_for_optimized( int $attachment_id ): void {
+        $original  = (int) get_post_meta( $attachment_id, self::META_ORIGINAL_SIZE, true );
+        $optimized = (int) get_post_meta( $attachment_id, self::META_OPTIMIZED_SIZE, true );
+
+        $this->log->record(
+            [
+                'attachment_id'  => $attachment_id,
+                'status'         => LogRepository::STATUS_SUCCESS,
+                'original_size'  => $original,
+                'optimized_size' => $optimized,
+            ]
+        );
+    }
+
+    /**
+     * Defensive log write for noop returns that aren't the
+     * idempotency case — empty path, missing file, etc. Without
+     * this, the bulk processor would reselect the same broken
+     * attachment forever because no log row gets written through
+     * the normal finalize() path.
+     */
+    private function record_unprocessable( int $attachment_id, string $reason ): void {
+        $this->log->record(
+            [
+                'attachment_id' => $attachment_id,
+                'status'        => LogRepository::STATUS_SKIPPED,
+                'error_message' => $reason,
+            ]
+        );
     }
 
     /**

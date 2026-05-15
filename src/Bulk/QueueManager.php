@@ -23,7 +23,6 @@ namespace GoodAgency\Compressly\Bulk;
 
 use GoodAgency\Compressly\Database\LogRepository;
 use GoodAgency\Compressly\Database\Schema;
-use GoodAgency\Compressly\Optimization\Optimizer;
 use GoodAgency\Compressly\Support\Logger;
 
 final class QueueManager {
@@ -165,6 +164,35 @@ final class QueueManager {
         $state['failed_items'] = [];
         $state['failed']       = 0;
         $this->persist( $state );
+
+        // Eligibility for the next bulk batch is keyed off the log
+        // table, so the in-state failed list is not enough — we also
+        // delete the failed log rows so next_batch_ids() will
+        // surface those attachments again on retry.
+        $this->delete_failed_log_rows();
+    }
+
+    private function delete_failed_log_rows(): void {
+        global $wpdb;
+        $table   = Schema::table_name();
+        $version = $this->current_plugin_version();
+
+        $deleted = $wpdb->query(
+            $wpdb->prepare(
+                "DELETE FROM {$table} WHERE status = %s AND plugin_version = %s",
+                LogRepository::STATUS_FAILED,
+                $version
+            )
+        );
+
+        Logger::trace(
+            'QueueManager::delete_failed_log_rows',
+            [
+                'deleted'    => $deleted,
+                'version'    => $version,
+                'last_error' => (string) $wpdb->last_error,
+            ]
+        );
     }
 
     public function transition_to_complete(): void {
@@ -174,24 +202,27 @@ final class QueueManager {
     }
 
     /**
+     * Next batch of eligible attachments.
+     *
+     * Pagination is keyed off the compressly_log table — an attachment
+     * is eligible iff it has no log row at the CURRENT plugin
+     * version. This is the durable "has been seen by Compressly"
+     * registry across runs and across statuses (success, partial,
+     * failed, skipped all leave a row), so re-running the bulk loop
+     * cannot re-select an attachment we already attempted. The old
+     * postmeta-based query would re-select skipped attachments
+     * forever because skipped paths never set _compressly_optimized
+     * — that's the bug that returned the same 5 IDs every batch.
+     *
      * @return int[]
      */
     public function next_batch_ids( int $size ): array {
-        $state    = $this->get_state();
-        $skip_ids = [];
-        foreach ( $state['failed_items'] as $item ) {
-            if ( is_array( $item ) && isset( $item['id'] ) ) {
-                $skip_ids[] = (int) $item['id'];
-            }
-        }
-
-        $ids = $this->query_pending_ids( $size, $skip_ids );
+        $ids = $this->query_eligible_ids( $size );
 
         Logger::trace(
             'QueueManager::next_batch_ids',
             [
                 'requested_size' => $size,
-                'skip_count'     => count( $skip_ids ),
                 'returned_ids'   => $ids,
                 'returned_count' => count( $ids ),
             ]
@@ -230,22 +261,52 @@ final class QueueManager {
     }
 
     /**
-     * Returns true once the current run has touched at least
-     * total_at_start attachments. Used by BulkProcessor to flip the
-     * state to STATUS_COMPLETE so the JS loop terminates and the
-     * "335 of 159 / stuck at 100%" display bug can no longer happen.
+     * Completion is "there are no more eligible attachment IDs to
+     * fetch" — NOT a counter threshold. Counters can stall if the
+     * optimizer returns noop for an attachment (meta says optimized
+     * but log row missing) or if an exception path forgets to bump
+     * them; tying completion to eligibility makes the bulk run
+     * truly bounded by the durable log table. The previous
+     * counter-based check could either declare completion early
+     * (counter math drifts past total_at_start) or never (5
+     * attachments looping never advanced counters).
      *
-     * @param array<string, mixed> $state
+     * @param array<string, mixed> $state Unused — retained for
+     *                                    backwards-compatible signature.
      */
-    public function is_run_complete( array $state ): bool {
-        $total = (int) ( $state['total_at_start'] ?? 0 );
-        if ( $total <= 0 ) {
-            return true;
-        }
-        $done = (int) ( $state['processed'] ?? 0 )
-              + (int) ( $state['failed'] ?? 0 )
-              + (int) ( $state['skipped'] ?? 0 );
-        return $done >= $total;
+    public function is_run_complete( array $state = [] ): bool {
+        unset( $state );
+        return $this->count_eligible_attachments() === 0;
+    }
+
+    /**
+     * Public so callers (BulkPage future polish, dashboard widgets)
+     * can render the "X attachments remaining" count without
+     * duplicating the SQL.
+     */
+    public function count_eligible_attachments(): int {
+        global $wpdb;
+        $log_table = Schema::table_name();
+        $version   = $this->current_plugin_version();
+
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        $sql = $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->posts} p
+             LEFT JOIN {$log_table} l
+                 ON l.attachment_id = p.ID
+                AND l.plugin_version = %s
+             WHERE p.post_type = 'attachment'
+               AND p.post_mime_type LIKE %s
+               AND l.id IS NULL",
+            $version,
+            'image/%'
+        );
+
+        return (int) $wpdb->get_var( $sql );
+    }
+
+    private function current_plugin_version(): string {
+        return defined( 'COMPRESSLY_VERSION' ) ? (string) COMPRESSLY_VERSION : '';
     }
 
     // ---------- Internals ----------
@@ -318,25 +379,12 @@ final class QueueManager {
     }
 
     /**
-     * Count attachments that the optimizer has not yet flagged as
-     * processed at the current plugin version. Used at run start to
-     * size total_at_start. Stays on post_meta because that's the
-     * same source next_batch_ids() filters against — keeping them
-     * aligned avoids a "started 0 of 100" race when a re-run is
-     * triggered immediately after upgrading the plugin version.
+     * Pending count for total_at_start. Mirrors the eligibility
+     * query in next_batch_ids() so the progress bar's denominator
+     * matches the work the queue will actually serve.
      */
     private function count_pending(): int {
-        global $wpdb;
-        $optimized_via_meta = (int) $wpdb->get_var(
-            $wpdb->prepare(
-                "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta}
-                 WHERE meta_key = %s
-                   AND meta_value = %s",
-                Optimizer::META_OPTIMIZED,
-                '1'
-            )
-        );
-        return max( 0, $this->count_total_images() - $optimized_via_meta );
+        return $this->count_eligible_attachments();
     }
 
     private function compute_bytes_saved(): int {
@@ -360,38 +408,44 @@ final class QueueManager {
     }
 
     /**
-     * @param int[] $skip_ids
+     * Pull the next chunk of attachments that have NO log row at the
+     * current plugin version. Successful, partial, failed, and
+     * skipped runs all leave a row, so every status terminates the
+     * attachment's eligibility — pagination cannot cursor-stick on
+     * the same IDs the way the postmeta-only version did when only
+     * success/partial set the optimized flag.
+     *
+     * Plugin-version match in the JOIN means a plugin upgrade
+     * re-opens eligibility for everything previously processed
+     * (UPSERT updates plugin_version on the next pass), aligning the
+     * bulk pipeline with the Optimizer's per-version idempotency
+     * check.
+     *
      * @return int[]
      */
-    private function query_pending_ids( int $size, array $skip_ids ): array {
+    private function query_eligible_ids( int $size ): array {
         global $wpdb;
 
-        $size = max( 1, min( 50, $size ) );
+        $size      = max( 1, min( 50, $size ) );
+        $log_table = Schema::table_name();
+        $version   = $this->current_plugin_version();
 
-        $skip_ids   = array_values( array_unique( array_map( 'intval', $skip_ids ) ) );
-        $skip_clause = '';
-        $skip_params = [];
-        if ( $skip_ids !== [] ) {
-            $placeholders = implode( ',', array_fill( 0, count( $skip_ids ), '%d' ) );
-            $skip_clause  = "AND p.ID NOT IN ({$placeholders})";
-            $skip_params  = $skip_ids;
-        }
+        $sql = $wpdb->prepare(
+            "SELECT p.ID FROM {$wpdb->posts} p
+             LEFT JOIN {$log_table} l
+                 ON l.attachment_id = p.ID
+                AND l.plugin_version = %s
+             WHERE p.post_type = 'attachment'
+               AND p.post_mime_type LIKE %s
+               AND l.id IS NULL
+             ORDER BY p.ID ASC
+             LIMIT %d",
+            $version,
+            'image/%',
+            $size
+        );
 
-        $sql = "SELECT p.ID FROM {$wpdb->posts} p
-                LEFT JOIN {$wpdb->postmeta} m
-                    ON m.post_id = p.ID
-                   AND m.meta_key = %s
-                WHERE p.post_type = 'attachment'
-                  AND p.post_mime_type LIKE 'image/%%'
-                  AND m.meta_id IS NULL
-                  {$skip_clause}
-                ORDER BY p.ID ASC
-                LIMIT %d";
-
-        $params  = array_merge( [ Optimizer::META_OPTIMIZED ], $skip_params, [ $size ] );
-        $prepared = $wpdb->prepare( $sql, $params ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-
-        $ids = $wpdb->get_col( $prepared );
+        $ids = $wpdb->get_col( $sql );
         return array_map( 'intval', is_array( $ids ) ? $ids : [] );
     }
 }

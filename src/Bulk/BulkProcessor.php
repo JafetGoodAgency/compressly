@@ -18,6 +18,7 @@ declare(strict_types=1);
 
 namespace GoodAgency\Compressly\Bulk;
 
+use GoodAgency\Compressly\Database\LogRepository;
 use GoodAgency\Compressly\Optimization\BackupManager;
 use GoodAgency\Compressly\Optimization\Optimizer;
 use GoodAgency\Compressly\Support\Logger;
@@ -148,6 +149,19 @@ final class BulkProcessor {
             } catch ( Throwable $e ) {
                 Logger::error( sprintf( 'BulkProcessor unhandled error for %d: %s', $id, $e->getMessage() ) );
                 $this->queue->record_failed( $id, $e->getMessage() );
+                // The optimizer normally writes its own log row via
+                // finalize(). An unhandled exception bypasses that,
+                // so we write one here directly — without it,
+                // next_batch_ids() (which paginates off the log
+                // table) would re-select this attachment on every
+                // subsequent batch and the run would never finish.
+                ( new LogRepository() )->record(
+                    [
+                        'attachment_id' => $id,
+                        'status'        => LogRepository::STATUS_FAILED,
+                        'error_message' => $e->getMessage(),
+                    ]
+                );
                 $batch['failed']++;
                 continue;
             }
@@ -203,18 +217,22 @@ final class BulkProcessor {
             }
         }
 
-        // After every batch, check whether the run has completed its
-        // budget. processed+skipped+failed >= total_at_start means
-        // the run is finished even if new uploads happened mid-flight
-        // and would otherwise keep the queue serving forever (this is
-        // what produced the "335 of 159 / stuck at 100%" UI bug).
+        // Completion is decided purely by eligibility: if no more
+        // attachments are eligible (no log row at the current plugin
+        // version), the run is done. Counter-based completion was
+        // wrong — counters could drift past total_at_start or stall
+        // (the 5-IDs-looping-forever bug) and either declare
+        // completion early or never. The empty-batch transition at
+        // the top of this method already covers the common case;
+        // this extra check catches runs where the LAST batch
+        // happened to be partially full but exhausted eligibility.
         $after = $this->queue->get_state();
         if (
             $after['status'] === QueueManager::STATUS_RUNNING
-            && $this->queue->is_run_complete( $after )
+            && $this->queue->is_run_complete()
         ) {
             Logger::trace(
-                'BulkProcessor::ajax_process_batch threshold reached → transition_to_complete',
+                'BulkProcessor::ajax_process_batch eligibility exhausted → transition_to_complete',
                 [
                     'processed'      => $after['processed'] ?? null,
                     'failed'         => $after['failed'] ?? null,
