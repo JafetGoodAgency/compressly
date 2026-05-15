@@ -35,6 +35,7 @@ final class ShortPixelClient {
     ];
 
     public const WAIT_SECONDS       = 60;
+    public const BATCH_WAIT_SECONDS = 90;
     private const MAX_RETRIES       = 3;
     private const RETRY_BACKOFF_SEC = [ 2, 4, 8 ];
     private const TEMP_DIR_NAME     = 'compressly-tmp';
@@ -133,6 +134,282 @@ final class ShortPixelClient {
             $list[] = $entry . ' (' . ( is_file( $full ) ? (string) filesize( $full ) : 'dir' ) . ')';
         }
         return $list;
+    }
+
+    /**
+     * Batch entry point: send all variants of an attachment in one
+     * SDK call. The single-file optimize() path stays for the
+     * deferred-unscaled-original cron handler (longer wait, one
+     * file, doesn't share a temp dir with the batch).
+     *
+     * Returns a structured result so the caller can route per-file
+     * outcomes to apply_sanity_and_move and also clean up the temp
+     * dirs created here — outcomes alone cannot carry the temp dir
+     * for "same" / failed entries, so it's surfaced separately.
+     *
+     * Whole-batch errors (auth, quota, network after retries) throw
+     * out of this method exactly like the single-file optimize(),
+     * so the Optimizer's existing pipeline-exception routing keeps
+     * working with no special-case code.
+     *
+     * @param string[] $source_paths
+     * @return array{outcomes: array<string, OptimizationOutcome|OptimizationException>, temp_dirs: string[]}
+     * @throws OptimizationException
+     */
+    public function optimize_batch( array $source_paths, ?int $wait_seconds = null ): array {
+        $outcomes  = [];
+        $temp_dirs = [];
+
+        if ( $source_paths === [] ) {
+            return [ 'outcomes' => $outcomes, 'temp_dirs' => $temp_dirs ];
+        }
+
+        $this->ensure_key_set();
+
+        $level  = $this->compression_level();
+        $webp   = (bool) $this->options->get( 'webp_enabled', true );
+        $resize = (bool) $this->options->get( 'resize_enabled', true );
+        $max_w  = (int) $this->options->get( 'resize_max_width', 2560 );
+        $max_h  = (int) $this->options->get( 'resize_max_height', 2560 );
+        $wait   = $wait_seconds !== null && $wait_seconds > 0
+            ? $wait_seconds
+            : self::BATCH_WAIT_SECONDS;
+
+        // Pre-flight per path. Missing/empty sources are recorded as
+        // exceptions in the outcome map and stripped from the batch
+        // so the SDK call only sees viable files.
+        $original_sizes = [];
+        $eligible       = [];
+        foreach ( $source_paths as $path ) {
+            $path = (string) $path;
+            if ( ! file_exists( $path ) ) {
+                $outcomes[ $path ] = OptimizationException::io( 'Source not found: ' . $path );
+                continue;
+            }
+            $size = (int) filesize( $path );
+            if ( $size <= 0 ) {
+                $outcomes[ $path ] = OptimizationException::io( 'Empty source: ' . $path );
+                continue;
+            }
+            $original_sizes[ $path ] = $size;
+            $eligible[]              = $path;
+        }
+
+        if ( $eligible === [] ) {
+            return [ 'outcomes' => $outcomes, 'temp_dirs' => $temp_dirs ];
+        }
+
+        $chunks       = array_chunk( $eligible, ShortPixelSdk::MAX_ALLOWED_FILES_PER_CALL );
+        $batch_number = 0;
+
+        foreach ( $chunks as $chunk ) {
+            $batch_number++;
+            $temp_dir    = $this->make_batch_temp_dir( $chunk, $batch_number );
+            $temp_dirs[] = $temp_dir;
+
+            Logger::trace( 'client optimize_batch start', [
+                'batch'  => $batch_number,
+                'files'  => $chunk,
+                'count'  => count( $chunk ),
+                'temp'   => $temp_dir,
+                'level'  => $level,
+                'webp'   => $webp,
+                'resize' => $resize,
+                'max_w'  => $max_w,
+                'max_h'  => $max_h,
+                'wait'   => $wait,
+            ] );
+
+            $result = $this->call_sdk_with_retry(
+                function () use ( $chunk, $temp_dir, $level, $webp, $resize, $max_w, $max_h, $wait ) {
+                    $commander = \ShortPixel\fromFiles( $chunk );
+                    $commander = $commander->optimize( $level );
+                    if ( $webp ) {
+                        $commander = $commander->generateWebP( true );
+                    }
+                    if ( $resize && $max_w > 0 && $max_h > 0 ) {
+                        $commander = $commander->resize( $max_w, $max_h, false );
+                    }
+                    return $commander->wait( $wait )->toFiles( $temp_dir );
+                }
+            );
+
+            Logger::trace( 'client optimize_batch result', [
+                'batch'             => $batch_number,
+                'temp'              => $temp_dir,
+                'succeeded'         => is_array( $result->succeeded ?? null ) ? count( $result->succeeded ) : null,
+                'same'              => is_array( $result->same ?? null ) ? count( $result->same ) : null,
+                'failed'            => is_array( $result->failed ?? null ) ? count( $result->failed ) : null,
+                'pending'           => is_array( $result->pending ?? null ) ? count( $result->pending ) : null,
+                'temp_dir_contents' => $this->scan_temp_dir( $temp_dir ),
+            ] );
+
+            $by_source = $this->index_batch_items_by_source( $result, $chunk );
+
+            foreach ( $chunk as $path ) {
+                $entry = $by_source[ $path ] ?? null;
+                $outcomes[ $path ] = $this->outcome_for_batch_item(
+                    $path,
+                    $original_sizes[ $path ],
+                    $temp_dir,
+                    $webp,
+                    $entry
+                );
+            }
+        }
+
+        return [ 'outcomes' => $outcomes, 'temp_dirs' => $temp_dirs ];
+    }
+
+    /**
+     * Build a temp dir distinct from the single-file optimize()
+     * naming so cleanup logs are easy to tell apart in trace output
+     * and so two concurrent runs (cron deferred + foreground bulk)
+     * cannot collide.
+     *
+     * @param string[] $chunk
+     */
+    private function make_batch_temp_dir( array $chunk, int $batch_number ): string {
+        $base = $this->temp_base_dir();
+        if ( ! wp_mkdir_p( $base ) ) {
+            throw OptimizationException::io( 'Cannot create temp base directory: ' . $base );
+        }
+
+        $signature = implode( '|', $chunk ) . '|' . $batch_number . '|' . uniqid( '', true );
+        $dir       = $base . '/batch-' . md5( $signature );
+
+        if ( ! wp_mkdir_p( $dir ) ) {
+            throw OptimizationException::io( 'Cannot create batch temp directory: ' . $dir );
+        }
+        return $dir;
+    }
+
+    /**
+     * Pivot the SDK result's succeeded/same/failed/pending arrays
+     * into a source-keyed map: source_path => ['bucket' => string,
+     * 'item' => object|null]. ShortPixel returns matched items
+     * carrying $item->OriginalFile (set by Result::toFiles()),
+     * which is the local path we sent in fromFiles().
+     *
+     * Items that don't match any chunk path are dropped — defensive
+     * against name-mismatch surprises but should never happen with
+     * file-mode requests.
+     *
+     * @param object   $result
+     * @param string[] $chunk
+     * @return array<string, array{bucket:string, item:object}>
+     */
+    private function index_batch_items_by_source( $result, array $chunk ): array {
+        $by_source = [];
+        $allowed   = array_flip( $chunk );
+
+        $buckets = [
+            'succeeded' => $result->succeeded ?? [],
+            'same'      => $result->same      ?? [],
+            'failed'    => $result->failed    ?? [],
+            'pending'   => $result->pending   ?? [],
+        ];
+
+        foreach ( $buckets as $bucket => $items ) {
+            if ( ! is_array( $items ) ) {
+                continue;
+            }
+            foreach ( $items as $item ) {
+                $candidate = '';
+                if ( is_object( $item ) && isset( $item->OriginalFile ) ) {
+                    $candidate = (string) $item->OriginalFile;
+                }
+                if ( $candidate === '' || ! isset( $allowed[ $candidate ] ) ) {
+                    continue;
+                }
+                $by_source[ $candidate ] = [
+                    'bucket' => $bucket,
+                    'item'   => $item,
+                ];
+            }
+        }
+
+        return $by_source;
+    }
+
+    /**
+     * Translate one bucketed SDK item into an OptimizationOutcome
+     * the Optimizer can hand back to apply_sanity_and_move(), or an
+     * OptimizationException if this particular variant failed (the
+     * other variants in the batch are unaffected).
+     *
+     * @param array{bucket:string, item:object}|null $entry
+     * @return OptimizationOutcome|OptimizationException
+     */
+    private function outcome_for_batch_item(
+        string $source_path,
+        int $original_size,
+        string $temp_dir,
+        bool $webp_requested,
+        ?array $entry
+    ) {
+        if ( $entry === null ) {
+            return OptimizationException::unknown( 'No batch result for ' . $source_path );
+        }
+
+        $bucket = $entry['bucket'];
+        $item   = $entry['item'];
+
+        if ( $bucket === 'failed' ) {
+            $code    = isset( $item->Status->Code ) ? (string) $item->Status->Code : '';
+            $message = isset( $item->Status->Message ) ? (string) $item->Status->Message : 'Optimization failed.';
+            return OptimizationException::unknown(
+                sprintf( 'ShortPixel reported failure (code=%s) for %s: %s', $code, $source_path, $message )
+            );
+        }
+
+        if ( $bucket === 'pending' ) {
+            return OptimizationException::network(
+                'Optimization still pending after wait window expired: ' . $source_path
+            );
+        }
+
+        if ( $bucket === 'same' ) {
+            return new OptimizationOutcome(
+                $source_path,
+                $original_size,
+                null,
+                $original_size,
+                null,
+                null,
+                true
+            );
+        }
+
+        // bucket === 'succeeded'
+        $basename     = basename( $source_path );
+        $optimized    = rtrim( $temp_dir, '/' ) . '/' . $basename;
+        $webp_target  = rtrim( $temp_dir, '/' ) . '/' . pathinfo( $basename, PATHINFO_FILENAME ) . '.webp';
+
+        clearstatcache();
+
+        if ( ! file_exists( $optimized ) ) {
+            return OptimizationException::io( 'Optimized file missing from temp dir: ' . $optimized );
+        }
+
+        $optimized_size = (int) filesize( $optimized );
+
+        $webp_path = null;
+        $webp_size = null;
+        if ( $webp_requested && file_exists( $webp_target ) ) {
+            $webp_path = $webp_target;
+            $webp_size = (int) filesize( $webp_target );
+        }
+
+        return new OptimizationOutcome(
+            $source_path,
+            $original_size,
+            $optimized,
+            $optimized_size,
+            $webp_path,
+            $webp_size,
+            false
+        );
     }
 
     /**

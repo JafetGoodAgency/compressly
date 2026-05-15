@@ -115,25 +115,7 @@ final class Optimizer {
 
         $totals = $this->fresh_totals();
 
-        foreach ( $paths as $role => $path ) {
-            try {
-                $this->process_single( (string) $path, (string) $role, $totals );
-            } catch ( OptimizationException $e ) {
-                $totals['failed']++;
-                $totals['last_error'] = sprintf( '[%s] %s: %s', $role, $e->kind(), $e->getMessage() );
-                $this->handle_pipeline_exception( $e, $attachment_id, (string) $path, (string) $role );
-
-                // Abort on auth/quota failures — every subsequent file
-                // will fail the same way and burn retries.
-                if ( in_array( $e->kind(), [ OptimizationException::KIND_API_KEY_INVALID, OptimizationException::KIND_QUOTA_EXCEEDED ], true ) ) {
-                    break;
-                }
-            } catch ( Throwable $e ) {
-                $totals['failed']++;
-                $totals['last_error'] = sprintf( '[%s] %s', $role, $e->getMessage() );
-                Logger::error( sprintf( 'Optimizer unexpected error role=%s attachment=%d path=%s: %s', $role, $attachment_id, $path, $e->getMessage() ) );
-            }
-        }
+        $this->process_attachment_batch( $attachment_id, $paths, $totals );
 
         foreach ( $deferred as $role => $path ) {
             $scheduled = wp_schedule_single_event(
@@ -340,6 +322,160 @@ final class Optimizer {
     }
 
     /**
+     * Batched per-attachment pipeline.
+     *
+     * Pre-batch: walk every (role, path) pair, run the validator,
+     * record skips/failures into totals, and run the backup for
+     * paths that pass validation. Backup happens before the SDK
+     * call because a successful API + failed backup would leave the
+     * site without an original to restore from.
+     *
+     * Batch: one optimize_batch() call covers every viable variant
+     * for the attachment (chunked at the SDK's 10-file ceiling).
+     * The Optimizer used to call the API once per variant — for an
+     * attachment with 5–7 sizes that's 5–7×15 s of SDK wait, which
+     * dominated the bulk run time. Batching collapses that to a
+     * single round-trip.
+     *
+     * Post-batch: route each per-source outcome to the existing
+     * apply_sanity_and_move() so the size sanity checks and atomic
+     * rename logic stay byte-for-byte the same. Auth / quota
+     * errors throw out of optimize_batch() and abort this
+     * attachment's run early, matching the previous "break the
+     * loop on these specific kinds" behavior.
+     *
+     * @param array<string, string> $paths role => absolute path
+     * @param array<string, mixed>  $totals
+     */
+    private function process_attachment_batch( int $attachment_id, array $paths, array &$totals ): void {
+        $eligible_paths_by_role = [];
+        $original_sizes         = [];
+
+        foreach ( $paths as $role => $path ) {
+            $role = (string) $role;
+            $path = (string) $path;
+
+            $validation = $this->validator->validate( $path );
+            Logger::trace( 'process_attachment_batch validation', [
+                'role'   => $role,
+                'path'   => $path,
+                'status' => $validation->status(),
+                'reason' => $validation->reason(),
+            ] );
+
+            if ( $validation->is_skip() ) {
+                $totals['skipped']++;
+                Logger::info( sprintf( 'Skip role=%s %s: %s', $role, $path, $validation->reason() ) );
+                continue;
+            }
+
+            if ( $validation->is_fail() ) {
+                $totals['failed']++;
+                $totals['last_error'] = sprintf( '[%s] io: %s', $role, $validation->reason() );
+                Logger::error( sprintf( 'Validation fail role=%s attachment=%d path=%s: %s', $role, $attachment_id, $path, $validation->reason() ) );
+                continue;
+            }
+
+            $original_sizes[ $path ] = (int) filesize( $path );
+
+            if ( (bool) $this->options->get( 'backup_originals', true ) ) {
+                try {
+                    $this->backup->backup( $path );
+                    Logger::trace( 'process_attachment_batch backup complete', [ 'role' => $role, 'path' => $path ] );
+                } catch ( OptimizationException $e ) {
+                    $totals['failed']++;
+                    $totals['last_error'] = sprintf( '[%s] %s: %s', $role, $e->kind(), $e->getMessage() );
+                    Logger::error( sprintf( 'Backup failed role=%s attachment=%d path=%s: %s', $role, $attachment_id, $path, $e->getMessage() ) );
+                    continue;
+                }
+            }
+
+            $eligible_paths_by_role[ $role ] = $path;
+        }
+
+        if ( $eligible_paths_by_role === [] ) {
+            Logger::trace( 'process_attachment_batch nothing eligible', [ 'attachment_id' => $attachment_id ] );
+            return;
+        }
+
+        try {
+            $batch = $this->client->optimize_batch( array_values( $eligible_paths_by_role ) );
+        } catch ( OptimizationException $e ) {
+            // Whole-batch failure (auth, quota, network-after-retries).
+            // Mirror the pre-batch behavior: surface the error against
+            // the first variant for the audit trail, set the transient
+            // flag via handle_pipeline_exception, and abort. The
+            // other variants in this attachment never made it to the
+            // API so they don't move counters either way.
+            $first_role = (string) array_key_first( $eligible_paths_by_role );
+            $first_path = $eligible_paths_by_role[ $first_role ];
+            $totals['failed']++;
+            $totals['last_error'] = sprintf( '[%s] %s: %s', $first_role, $e->kind(), $e->getMessage() );
+            $this->handle_pipeline_exception( $e, $attachment_id, $first_path, $first_role );
+            return;
+        } catch ( Throwable $e ) {
+            $first_role = (string) array_key_first( $eligible_paths_by_role );
+            $totals['failed']++;
+            $totals['last_error'] = sprintf( '[%s] %s', $first_role, $e->getMessage() );
+            Logger::error( sprintf( 'Optimizer unexpected batch error attachment=%d: %s', $attachment_id, $e->getMessage() ) );
+            return;
+        }
+
+        $outcomes  = $batch['outcomes'];
+        $temp_dirs = $batch['temp_dirs'];
+
+        try {
+            foreach ( $eligible_paths_by_role as $role => $path ) {
+                $result = $outcomes[ $path ] ?? null;
+
+                if ( $result instanceof OptimizationException ) {
+                    $totals['failed']++;
+                    $totals['last_error'] = sprintf( '[%s] %s: %s', $role, $result->kind(), $result->getMessage() );
+                    $this->handle_pipeline_exception( $result, $attachment_id, $path, $role );
+                    continue;
+                }
+
+                if ( ! $result instanceof OptimizationOutcome ) {
+                    $totals['failed']++;
+                    $totals['last_error'] = sprintf( '[%s] missing outcome', $role );
+                    Logger::error( sprintf( 'Optimizer missing outcome role=%s attachment=%d path=%s', $role, $attachment_id, $path ) );
+                    continue;
+                }
+
+                if ( $result->api_reported_same() ) {
+                    Logger::trace( 'process_attachment_batch api_reported_same', [ 'role' => $role, 'bytes' => $original_sizes[ $path ] ] );
+                    $totals['original']  += $original_sizes[ $path ];
+                    $totals['optimized'] += $original_sizes[ $path ];
+                    $totals['processed']++;
+                    continue;
+                }
+
+                try {
+                    $this->apply_sanity_and_move( $path, $result, $role, $totals );
+                } catch ( OptimizationException $e ) {
+                    $totals['failed']++;
+                    $totals['last_error'] = sprintf( '[%s] %s: %s', $role, $e->kind(), $e->getMessage() );
+                    $this->handle_pipeline_exception( $e, $attachment_id, $path, $role );
+                } catch ( Throwable $e ) {
+                    $totals['failed']++;
+                    $totals['last_error'] = sprintf( '[%s] %s', $role, $e->getMessage() );
+                    Logger::error( sprintf( 'Optimizer unexpected error role=%s attachment=%d path=%s: %s', $role, $attachment_id, $path, $e->getMessage() ) );
+                }
+            }
+        } finally {
+            foreach ( $temp_dirs as $temp_dir ) {
+                $this->client->cleanup_temp( (string) $temp_dir );
+            }
+        }
+    }
+
+    /**
+     * Single-file pipeline retained for the deferred-cron path
+     * (raw unscaled originals). Cron is not blocking a user so it
+     * uses a longer SDK wait, and the file lives outside the
+     * attachment's main variant set, so a one-call optimize is
+     * simpler than wedging it into the batch flow.
+     *
      * @param array<string, mixed> $totals
      * @throws OptimizationException
      */
