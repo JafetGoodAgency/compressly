@@ -3,7 +3,7 @@
  * Plugin Name:       Compressly
  * Plugin URI:        https://github.com/JafetGoodAgency/compressly
  * Description:       Lightweight image optimization powered by ShortPixel.
- * Version:           1.0.0
+ * Version:           1.0.1
  * Author:            GoodAgency
  * Author URI:        https://github.com/JafetGoodAgency
  * License:           Proprietary
@@ -19,7 +19,7 @@ declare(strict_types=1);
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'COMPRESSLY_VERSION', '1.0.0' );
+define( 'COMPRESSLY_VERSION', '1.0.1' );
 define( 'COMPRESSLY_PLUGIN_FILE', __FILE__ );
 define( 'COMPRESSLY_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'COMPRESSLY_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
