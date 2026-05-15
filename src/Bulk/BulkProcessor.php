@@ -203,6 +203,28 @@ final class BulkProcessor {
             }
         }
 
+        // After every batch, check whether the run has completed its
+        // budget. processed+skipped+failed >= total_at_start means
+        // the run is finished even if new uploads happened mid-flight
+        // and would otherwise keep the queue serving forever (this is
+        // what produced the "335 of 159 / stuck at 100%" UI bug).
+        $after = $this->queue->get_state();
+        if (
+            $after['status'] === QueueManager::STATUS_RUNNING
+            && $this->queue->is_run_complete( $after )
+        ) {
+            Logger::trace(
+                'BulkProcessor::ajax_process_batch threshold reached → transition_to_complete',
+                [
+                    'processed'      => $after['processed'] ?? null,
+                    'failed'         => $after['failed'] ?? null,
+                    'skipped'        => $after['skipped'] ?? null,
+                    'total_at_start' => $after['total_at_start'] ?? null,
+                ]
+            );
+            $this->queue->transition_to_complete();
+        }
+
         Logger::trace(
             'BulkProcessor::ajax_process_batch exit',
             [

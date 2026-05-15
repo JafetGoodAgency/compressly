@@ -21,6 +21,8 @@ declare(strict_types=1);
 
 namespace GoodAgency\Compressly\Bulk;
 
+use GoodAgency\Compressly\Database\LogRepository;
+use GoodAgency\Compressly\Database\Schema;
 use GoodAgency\Compressly\Optimization\Optimizer;
 use GoodAgency\Compressly\Support\Logger;
 
@@ -199,19 +201,51 @@ final class QueueManager {
     }
 
     /**
-     * @return array{total:int, optimized:int, pending:int, bytes_saved:int}
+     * Dashboard stats.
+     *
+     * "Optimized" and "Failed" are derived from the compressly_log
+     * audit table (most recent row per attachment) instead of the
+     * queue counters or post_meta. The queue option resets per run,
+     * so reading from it produced "Failed (this run)" semantics and
+     * could drift past the totals — see the "335 of 159" incident.
+     * The log table is the durable source of truth across runs.
+     *
+     * @return array{total:int, optimized:int, pending:int, failed:int, bytes_saved:int}
      */
     public function get_stats(): array {
-        $total     = $this->count_total_images();
-        $optimized = $this->count_optimized();
-        $pending   = max( 0, $total - $optimized );
+        $total    = $this->count_total_images();
+        $by_state = $this->count_by_latest_log_status();
+
+        $optimized = (int) ( $by_state['optimized'] ?? 0 );
+        $failed    = (int) ( $by_state['failed'] ?? 0 );
+        $pending   = max( 0, $total - $optimized - $failed );
 
         return [
             'total'       => $total,
             'optimized'   => $optimized,
             'pending'     => $pending,
+            'failed'      => $failed,
             'bytes_saved' => $this->compute_bytes_saved(),
         ];
+    }
+
+    /**
+     * Returns true once the current run has touched at least
+     * total_at_start attachments. Used by BulkProcessor to flip the
+     * state to STATUS_COMPLETE so the JS loop terminates and the
+     * "335 of 159 / stuck at 100%" display bug can no longer happen.
+     *
+     * @param array<string, mixed> $state
+     */
+    public function is_run_complete( array $state ): bool {
+        $total = (int) ( $state['total_at_start'] ?? 0 );
+        if ( $total <= 0 ) {
+            return true;
+        }
+        $done = (int) ( $state['processed'] ?? 0 )
+              + (int) ( $state['failed'] ?? 0 )
+              + (int) ( $state['skipped'] ?? 0 );
+        return $done >= $total;
     }
 
     // ---------- Internals ----------
@@ -243,9 +277,57 @@ final class QueueManager {
         );
     }
 
-    private function count_optimized(): int {
+    /**
+     * Bucket every attachment in the log table by its MOST RECENT
+     * status, so re-runs that flipped a previously-failed attachment
+     * to success move it out of the "failed" bucket. Returns the
+     * counts the dashboard cards need in a single query.
+     *
+     * @return array{optimized:int, failed:int}
+     */
+    private function count_by_latest_log_status(): array {
         global $wpdb;
-        return (int) $wpdb->get_var(
+        $table = Schema::table_name();
+
+        $row = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT
+                    SUM( CASE WHEN l.status IN (%s, %s, %s) THEN 1 ELSE 0 END ) AS optimized,
+                    SUM( CASE WHEN l.status = %s THEN 1 ELSE 0 END ) AS failed
+                 FROM {$table} l
+                 INNER JOIN (
+                    SELECT attachment_id, MAX(id) AS latest_id
+                    FROM {$table}
+                    GROUP BY attachment_id
+                 ) t ON t.latest_id = l.id",
+                LogRepository::STATUS_SUCCESS,
+                LogRepository::STATUS_PARTIAL,
+                LogRepository::STATUS_SKIPPED,
+                LogRepository::STATUS_FAILED
+            )
+        );
+
+        if ( ! is_object( $row ) ) {
+            return [ 'optimized' => 0, 'failed' => 0 ];
+        }
+
+        return [
+            'optimized' => (int) ( $row->optimized ?? 0 ),
+            'failed'    => (int) ( $row->failed ?? 0 ),
+        ];
+    }
+
+    /**
+     * Count attachments that the optimizer has not yet flagged as
+     * processed at the current plugin version. Used at run start to
+     * size total_at_start. Stays on post_meta because that's the
+     * same source next_batch_ids() filters against — keeping them
+     * aligned avoids a "started 0 of 100" race when a re-run is
+     * triggered immediately after upgrading the plugin version.
+     */
+    private function count_pending(): int {
+        global $wpdb;
+        $optimized_via_meta = (int) $wpdb->get_var(
             $wpdb->prepare(
                 "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta}
                  WHERE meta_key = %s
@@ -254,10 +336,7 @@ final class QueueManager {
                 '1'
             )
         );
-    }
-
-    private function count_pending(): int {
-        return max( 0, $this->count_total_images() - $this->count_optimized() );
+        return max( 0, $this->count_total_images() - $optimized_via_meta );
     }
 
     private function compute_bytes_saved(): int {

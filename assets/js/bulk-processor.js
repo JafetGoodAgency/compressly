@@ -2,8 +2,16 @@
  * Compressly bulk processor.
  *
  * Drives the AJAX loop for Media → Compressly. Vanilla JS, fetch API,
- * no jQuery. Polling stops when the server reports a non-running
- * status or returns an empty batch (queue exhausted).
+ * no jQuery.
+ *
+ * Page-load policy: the loop NEVER fires implicitly. The initial state
+ * fetch only renders what the server reports — if a previous run was
+ * still flagged "running" or "paused" (e.g. the operator closed the
+ * tab mid-batch), the page shows a resume banner with Resume and
+ * Cancel-and-Reset buttons. The loop only runs in response to an
+ * explicit user click on Start, Resume, or the Resume banner. This
+ * exists to prevent a credit-burn regression in which reopening the
+ * bulk page silently re-pumped the SDK against ShortPixel.
  */
 
 ( function () {
@@ -83,6 +91,26 @@
         return strings.idle || 'Idle';
     }
 
+    function formatTimeAgo( startedAt ) {
+        var now = Math.floor( Date.now() / 1000 );
+        var diff = Math.max( 0, now - ( parseInt( startedAt, 10 ) || 0 ) );
+        if ( diff < 60 ) {
+            return ( strings.agoSeconds || '%d seconds' ).replace( '%d', diff );
+        }
+        var minutes = Math.floor( diff / 60 );
+        if ( minutes < 60 ) {
+            var minTpl = minutes === 1
+                ? ( strings.agoMinute || '%d minute' )
+                : ( strings.agoMinutes || '%d minutes' );
+            return minTpl.replace( '%d', minutes );
+        }
+        var hours = Math.floor( minutes / 60 );
+        var hourTpl = hours === 1
+            ? ( strings.agoHour || '%d hour' )
+            : ( strings.agoHours || '%d hours' );
+        return hourTpl.replace( '%d', hours );
+    }
+
     function updateRing( percent ) {
         var ring = $( '[data-compressly-ring]' );
         if ( ! ring ) { return; }
@@ -92,15 +120,13 @@
         ring.style.strokeDashoffset = circumference * ( 1 - Math.min( 1, Math.max( 0, percent / 100 ) ) );
     }
 
-    function renderStats( stats, state ) {
+    function renderStats( stats ) {
         if ( ! stats ) { return; }
-        setText( '[data-compressly-stat="total"]',     ( stats.total       || 0 ).toLocaleString() );
-        setText( '[data-compressly-stat="optimized"]', ( stats.optimized   || 0 ).toLocaleString() );
-        setText( '[data-compressly-stat="pending"]',   ( stats.pending     || 0 ).toLocaleString() );
+        setText( '[data-compressly-stat="total"]',       ( stats.total       || 0 ).toLocaleString() );
+        setText( '[data-compressly-stat="optimized"]',   ( stats.optimized   || 0 ).toLocaleString() );
+        setText( '[data-compressly-stat="pending"]',     ( stats.pending     || 0 ).toLocaleString() );
+        setText( '[data-compressly-stat="failed"]',      ( stats.failed      || 0 ).toLocaleString() );
         setText( '[data-compressly-stat="bytes_saved"]', formatBytes( stats.bytes_saved ) );
-
-        var failedCount = state && Array.isArray( state.failed_items ) ? state.failed_items.length : 0;
-        setText( '[data-compressly-stat="failed"]', failedCount.toLocaleString() );
     }
 
     function renderState( state ) {
@@ -116,9 +142,13 @@
         setText( '[data-compressly-status]', formatStatus( status ) );
 
         var totalAtStart = parseInt( state.total_at_start, 10 ) || 0;
-        var done = ( parseInt( state.processed, 10 ) || 0 )
-                 + ( parseInt( state.failed, 10 ) || 0 )
-                 + ( parseInt( state.skipped, 10 ) || 0 );
+        var rawDone = ( parseInt( state.processed, 10 ) || 0 )
+                    + ( parseInt( state.failed, 10 ) || 0 )
+                    + ( parseInt( state.skipped, 10 ) || 0 );
+        // Clamp the displayed "done" so a drift past total_at_start
+        // (e.g. concurrent uploads during a run) can no longer
+        // render as "335 of 159".
+        var done = totalAtStart > 0 ? Math.min( rawDone, totalAtStart ) : rawDone;
         var percent = totalAtStart > 0 ? Math.min( 100, Math.round( ( done / totalAtStart ) * 100 ) ) : ( isComplete ? 100 : 0 );
         setText( '[data-compressly-percent]', percent + '%' );
         updateRing( percent );
@@ -148,9 +178,49 @@
         setText( '[data-compressly-error-count]', failedItems.length );
     }
 
+    /**
+     * Banner only shows on initial page load and only when the server
+     * reports an unfinished run. It is the user's explicit choice
+     * whether to Resume (kick off the loop) or Cancel (wipe state).
+     */
+    function renderResumeBanner( state ) {
+        if ( ! state ) {
+            setVisible( '[data-compressly-resume-banner]', false );
+            return;
+        }
+        var status = state.status || 'idle';
+        if ( status !== 'running' && status !== 'paused' ) {
+            setVisible( '[data-compressly-resume-banner]', false );
+            return;
+        }
+
+        var totalAtStart = parseInt( state.total_at_start, 10 ) || 0;
+        var rawDone = ( parseInt( state.processed, 10 ) || 0 )
+                    + ( parseInt( state.failed, 10 ) || 0 )
+                    + ( parseInt( state.skipped, 10 ) || 0 );
+        var done = totalAtStart > 0 ? Math.min( rawDone, totalAtStart ) : rawDone;
+        var ago = formatTimeAgo( state.started_at );
+
+        var template = status === 'paused'
+            ? ( strings.resumePaused || 'Previous bulk is paused (started %1$s ago, %2$s of %3$s processed).' )
+            : ( strings.resumeRunning || 'Previous bulk in progress (started %1$s ago, %2$s of %3$s processed).' );
+
+        var text = template
+            .replace( '%1$s', ago )
+            .replace( '%2$s', done.toLocaleString() )
+            .replace( '%3$s', totalAtStart.toLocaleString() );
+
+        setText( '[data-compressly-resume-text]', text );
+        setVisible( '[data-compressly-resume-banner]', true );
+    }
+
+    function hideResumeBanner() {
+        setVisible( '[data-compressly-resume-banner]', false );
+    }
+
     function applySnapshot( data ) {
         if ( ! data ) { return; }
-        renderStats( data.stats, data.state );
+        renderStats( data.stats );
         renderState( data.state );
     }
 
@@ -188,6 +258,7 @@
     function handleAction( action ) {
         switch ( action ) {
             case 'start':
+                hideResumeBanner();
                 ajax( 'bulk_start' ).then( function ( data ) {
                     applySnapshot( data );
                     if ( data && data.state && data.state.status === 'running' ) {
@@ -206,6 +277,8 @@
                 break;
 
             case 'resume':
+            case 'resume-from-banner':
+                hideResumeBanner();
                 ajax( 'bulk_resume' ).then( function ( data ) {
                     applySnapshot( data );
                     startLoop();
@@ -215,7 +288,9 @@
                 break;
 
             case 'cancel':
+            case 'cancel-from-banner':
                 stopLoop();
+                hideResumeBanner();
                 ajax( 'bulk_cancel' ).then( applySnapshot ).catch( function ( err ) {
                     window.console && console.error && console.error( err );
                 } );
@@ -266,14 +341,13 @@
         handleAction( btn.getAttribute( 'data-compressly-action' ) );
     } );
 
-    // Initial load: pull current state and auto-resume if a run was
-    // already running when the page was opened (e.g. user navigated
-    // away mid-bulk and came back).
+    // Initial load: fetch state once, render it, and surface the
+    // resume banner if a previous run is still flagged running or
+    // paused. CRUCIALLY this never calls startLoop() — the loop only
+    // fires from an explicit user click. See file header comment.
     ajax( 'bulk_stats' ).then( function ( data ) {
         applySnapshot( data );
-        if ( data && data.state && data.state.status === 'running' ) {
-            startLoop();
-        }
+        renderResumeBanner( data && data.state );
     } ).catch( function ( err ) {
         window.console && console.error && console.error( err );
     } );

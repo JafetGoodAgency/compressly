@@ -82,6 +82,18 @@ final class BulkPage {
         }
 
         ?>
+        <div class="compressly-resume-banner notice notice-warning" data-compressly-resume-banner hidden>
+            <p class="compressly-resume-text" data-compressly-resume-text></p>
+            <p class="compressly-resume-actions">
+                <button type="button" class="button button-primary" data-compressly-action="resume-from-banner">
+                    <?php esc_html_e( 'Resume', 'compressly' ); ?>
+                </button>
+                <button type="button" class="button button-link-delete" data-compressly-action="cancel-from-banner">
+                    <?php esc_html_e( 'Cancel and Reset', 'compressly' ); ?>
+                </button>
+            </p>
+        </div>
+
         <div class="compressly-stats-grid">
             <div class="compressly-stat-card">
                 <div class="compressly-stat-value" data-compressly-stat="total">—</div>
@@ -97,7 +109,7 @@ final class BulkPage {
             </div>
             <div class="compressly-stat-card">
                 <div class="compressly-stat-value" data-compressly-stat="failed">0</div>
-                <div class="compressly-stat-label"><?php esc_html_e( 'Failed (this run)', 'compressly' ); ?></div>
+                <div class="compressly-stat-label"><?php esc_html_e( 'Failed', 'compressly' ); ?></div>
             </div>
             <div class="compressly-stat-card">
                 <div class="compressly-stat-value" data-compressly-stat="bytes_saved">—</div>
